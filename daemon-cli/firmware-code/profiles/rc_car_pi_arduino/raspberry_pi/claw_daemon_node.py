@@ -129,6 +129,12 @@ class Claw:
             raise ValueError("invalid state")
         target = self._open if st == "open" else self._hold
         with self._lock:
+            # Avoid repeated smoothing loops (can cause visible twitch) if we're already at target.
+            current = self._servo.value
+            if current is not None and abs(current - target) <= self._step:
+                self._servo.value = target
+                self._state = st
+                return
             self._move_smooth(target)
             self._state = st
 
@@ -177,21 +183,25 @@ class Watchdog:
         self._watchdog_ms = max(150, int(watchdog_ms))
         self._lock = threading.Lock()
         self._last_cmd_ms = _now_ms()
+        # Only enforce the watchdog after we've seen an "active" command (RUN).
+        self._armed = False
 
-    def bump(self) -> None:
+    def bump(self, active: bool) -> None:
         with self._lock:
             self._last_cmd_ms = _now_ms()
+            self._armed = bool(active)
 
     def loop(self) -> None:
         while True:
             time.sleep(0.15)
             with self._lock:
                 dt = _now_ms() - self._last_cmd_ms
-            if dt > self._watchdog_ms:
+                armed = self._armed
+            if armed and dt > self._watchdog_ms:
                 self._claw.stop_safe()
-                # Don't spam stop.
+                # Disarm after one safe-stop so we don't repeatedly drive the servo while idle.
                 with self._lock:
-                    self._last_cmd_ms = _now_ms()
+                    self._armed = False
 
 
 def handle_run(claw: Claw, token: str, args: list[str]) -> str:
@@ -266,7 +276,7 @@ def client_loop(conn: socket.socket, addr, manifest: dict, claw: Claw, watchdog:
                     continue
 
                 if cmd == "STOP":
-                    watchdog.bump()
+                    watchdog.bump(active=False)
                     claw.stop_safe()
                     state.last_token = "STOP"
                     send_line(conn, "OK")
@@ -277,7 +287,7 @@ def client_loop(conn: socket.socket, addr, manifest: dict, claw: Claw, watchdog:
                     if not token:
                         send_line(conn, "ERR BAD_ARGS missing_token")
                         continue
-                    watchdog.bump()
+                    watchdog.bump(active=True)
                     resp = handle_run(claw, token, run_args)
                     if resp == "OK":
                         state.last_token = token.upper()
