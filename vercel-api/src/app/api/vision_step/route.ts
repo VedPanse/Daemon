@@ -2,6 +2,13 @@ import { NextResponse } from "next/server";
 import jpeg from "jpeg-js";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  canonicalLabel,
+  parseInstruction as parseInstructionPolicy,
+  selectTargetDeterministic,
+  shouldBypassPerceptionTask,
+  updateTargetLockCtx
+} from "@/lib/visionPolicy";
 
 export const runtime = "nodejs";
 
@@ -90,6 +97,11 @@ interface VisionState {
   motion_ctx: {
     consumed: boolean;
   };
+  target_lock_ctx: {
+    label: string;
+    bbox: { x: number; y: number; w: number; h: number };
+    lost_ticks: number;
+  } | null;
 }
 
 interface SystemManifestInput {
@@ -123,7 +135,8 @@ const DEFAULT_STATE: VisionState = {
   },
   motion_ctx: {
     consumed: false
-  }
+  },
+  target_lock_ctx: null
 };
 
 const ALIGN_OFFSET_THRESHOLD = 0.07;
@@ -233,6 +246,7 @@ function normalizeState(input: unknown): VisionState {
   const capabilitiesInput = isObject(input.capabilities) ? input.capabilities : {};
   const instructionCtxInput = isObject(input.instruction_ctx) ? input.instruction_ctx : {};
   const motionCtxInput = isObject(input.motion_ctx) ? input.motion_ctx : {};
+  const lockInput = isObject(input.target_lock_ctx) ? input.target_lock_ctx : null;
 
   const scanDir = toNumberOr(DEFAULT_STATE.scan_dir, input.scan_dir);
   const scanTicks = toNumberOr(DEFAULT_STATE.scan_ticks, input.scan_ticks);
@@ -253,7 +267,29 @@ function normalizeState(input: unknown): VisionState {
     },
     motion_ctx: {
       consumed: Boolean(motionCtxInput.consumed)
-    }
+    },
+    target_lock_ctx:
+      lockInput &&
+      typeof lockInput.label === "string" &&
+      isObject(lockInput.bbox) &&
+      typeof lockInput.bbox.x === "number" &&
+      typeof lockInput.bbox.y === "number" &&
+      typeof lockInput.bbox.w === "number" &&
+      typeof lockInput.bbox.h === "number"
+        ? {
+            label: lockInput.label,
+            bbox: {
+              x: clamp(lockInput.bbox.x, 0, 1),
+              y: clamp(lockInput.bbox.y, 0, 1),
+              w: clamp(lockInput.bbox.w, 0, 1),
+              h: clamp(lockInput.bbox.h, 0, 1)
+            },
+            lost_ticks:
+              typeof lockInput.lost_ticks === "number" && Number.isFinite(lockInput.lost_ticks)
+                ? Math.max(0, Math.floor(lockInput.lost_ticks))
+                : 0
+          }
+        : null
   };
 }
 
@@ -270,159 +306,8 @@ function normalizeInstruction(instruction: string): string {
   return instruction.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function parseCount(text: string): number {
-  const digit = text.match(/\b(\d+)\b/);
-  if (digit) {
-    return clamp(Number(digit[1]), 1, 10);
-  }
-
-  if (text.includes("once")) return 1;
-  if (text.includes("twice")) return 2;
-  if (text.includes("thrice")) return 3;
-
-  const wordMap: Record<string, number> = {
-    one: 1,
-    two: 2,
-    three: 3,
-    four: 4,
-    five: 5,
-    six: 6,
-    seven: 7,
-    eight: 8,
-    nine: 9,
-    ten: 10
-  };
-
-  for (const [word, value] of Object.entries(wordMap)) {
-    if (text.includes(word)) {
-      return value;
-    }
-  }
-
-  return 1;
-}
-
-function parseDistanceMeters(text: string): number | undefined {
-  const match = text.match(/\b(\d+(?:\.\d+)?)\s*(meter|meters|m)\b/);
-  if (!match) {
-    return undefined;
-  }
-  return clamp(Number(match[1]), 0.1, 10);
-}
-
-function cleanTargetPhrase(value: string | null): string | null {
-  if (!value) return null;
-  const cleaned = value
-    .replace(/\b(and\s+grab\s+it|and\s+pick\s+it\s+up|please|now)\b/g, "")
-    .replace(/[.,!?]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return cleaned || null;
-}
-
-function extractTargetQuery(text: string): string | null {
-  const patterns = [
-    /search for\s+(.+?)(?:\s+and\s+|$)/,
-    /pick up\s+(?:the\s+)?(.+?)$/,
-    /grab\s+(?:the\s+)?(.+?)$/,
-    /follow\s+(?:the\s+)?(.+?)$/,
-    /approach\s+(?:the\s+)?(.+?)$/
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) {
-      return cleanTargetPhrase(match[1]);
-    }
-  }
-
-  return null;
-}
-
-function extractColor(query: string | null): TargetSpec["color"] {
-  if (!query) return null;
-  if (query.includes("red")) return "red";
-  if (query.includes("blue")) return "blue";
-  if (query.includes("green")) return "green";
-  if (query.includes("yellow")) return "yellow";
-  return null;
-}
-
-function extractLabel(query: string | null): string | null {
-  if (!query) return null;
-
-  const stopWords = new Set(["the", "a", "an", "red", "blue", "green", "yellow", "object", "it"]);
-  const tokens = query
-    .split(/\s+/)
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0 && !stopWords.has(t));
-
-  if (tokens.length === 0) return null;
-
-  const joined = tokens.join(" ");
-  const canonical = ["phone", "banana", "cube", "box", "bottle", "backpack", "obstacle"];
-  for (const item of canonical) {
-    if (joined.includes(item)) {
-      return item;
-    }
-  }
-
-  return tokens[tokens.length - 1];
-}
-
 function parseInstruction(instruction: string): ParsedInstruction {
-  const text = normalizeInstruction(instruction);
-  const targetQuery = extractTargetQuery(text);
-  const target: TargetSpec = {
-    query: targetQuery,
-    color: extractColor(targetQuery),
-    label: extractLabel(targetQuery)
-  };
-
-  if (/(emergency stop|e-stop|estop|abort|halt|\bstop\b)/.test(text)) {
-    return {
-      task_type: "stop",
-      stop_kind: /(emergency stop|e-stop|estop|abort)/.test(text) ? "emergency" : "normal",
-      target
-    };
-  }
-
-  if (/circle|square|triangle|move forward|go forward/.test(text)) {
-    if (/circle/.test(text)) {
-      return { task_type: "move-pattern", pattern: "circle", count: parseCount(text), target };
-    }
-    if (/square/.test(text)) {
-      return { task_type: "move-pattern", pattern: "square", count: parseCount(text), target };
-    }
-    if (/triangle/.test(text)) {
-      return { task_type: "move-pattern", pattern: "triangle", count: parseCount(text), target };
-    }
-    return {
-      task_type: "move-pattern",
-      pattern: "forward",
-      distance_m: parseDistanceMeters(text) ?? 1,
-      count: 1,
-      target
-    };
-  }
-
-  if (/follow\s+/.test(text)) {
-    return { task_type: "follow", target };
-  }
-
-  if (/search for\s+/.test(text)) {
-    return { task_type: "search", target };
-  }
-
-  if (/avoid/.test(text) && /approach/.test(text)) {
-    return { task_type: "avoid+approach", target };
-  }
-
-  if (/pick up|grab/.test(text)) {
-    return { task_type: "pick-object", target };
-  }
-
-  return { task_type: "unknown", target };
+  return parseInstructionPolicy(instruction);
 }
 
 function decodeImage(base64Input: string): { data: Uint8Array; width: number; height: number } {
@@ -761,49 +646,6 @@ async function detectObjectsWithOpenAI(frameBase64: string, instruction: string)
   }
 }
 
-function canonicalLabel(raw: string): string {
-  const label = raw.toLowerCase().trim();
-  const aliases: Array<{ canonical: string; terms: string[] }> = [
-    { canonical: "phone", terms: ["phone", "cell phone", "mobile phone", "smartphone", "iphone", "android phone"] },
-    { canonical: "bottle", terms: ["bottle", "water bottle"] },
-    { canonical: "backpack", terms: ["backpack", "bag", "rucksack"] },
-    { canonical: "cube", terms: ["cube", "block"] },
-    { canonical: "box", terms: ["box", "package"] }
-  ];
-
-  for (const group of aliases) {
-    if (group.terms.some((term) => label === term || label.includes(term))) {
-      return group.canonical;
-    }
-  }
-
-  return label;
-}
-
-function selectTarget(objects: PerceivedObject[], parsed: ParsedInstruction): PerceivedObject | undefined {
-  if (objects.length === 0) return undefined;
-
-  const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
-  const targetColor = parsed.target.color || null;
-  const targetQuery = parsed.target.query ? canonicalLabel(parsed.target.query) : "";
-
-  const scored = objects.map((obj) => {
-    const label = canonicalLabel(obj.label);
-    const attrs = (obj.attributes || []).map((v) => v.toLowerCase());
-    let score = obj.confidence;
-
-    if (targetLabel && label === targetLabel) score += 2.5;
-    if (targetLabel && label.includes(targetLabel)) score += 1.5;
-    if (targetQuery && label.includes(targetQuery)) score += 1.0;
-    if (targetColor && (label.includes(targetColor) || attrs.some((a) => a.includes(targetColor)))) score += 1.0;
-
-    return { obj, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0]?.obj;
-}
-
 function composePerception(objects: PerceivedObject[], selected: PerceivedObject | undefined, summary: string): Perception {
   const bbox = selected?.bbox || null;
   const area = bbox ? bbox.w * bbox.h : 0;
@@ -825,9 +667,10 @@ function composePerception(objects: PerceivedObject[], selected: PerceivedObject
 async function analyzePerception(
   frameBase64: string,
   instruction: string,
-  parsed: ParsedInstruction
+  parsed: ParsedInstruction,
+  targetLockCtx: VisionState["target_lock_ctx"]
 ): Promise<{ perception: Perception; source: "openai_vision" | "fallback_color" | "none"; notes: string[] }> {
-  if (parsed.task_type === "stop" || parsed.task_type === "move-pattern") {
+  if (shouldBypassPerceptionTask(parsed.task_type)) {
     return {
       perception: composePerception([], undefined, "Perception bypassed for non-visual command"),
       source: "none",
@@ -837,12 +680,12 @@ async function analyzePerception(
 
   const notes: string[] = [];
   const openai = await detectObjectsWithOpenAI(frameBase64, instruction);
-  const selectedFromOpenAI = selectTarget(openai.objects, parsed);
+  const selectedFromOpenAI = selectTargetDeterministic(openai.objects, parsed, targetLockCtx);
   if (selectedFromOpenAI && selectedFromOpenAI.confidence >= OPENAI_MIN_CONFIDENCE) {
     return {
       perception: composePerception(openai.objects, selectedFromOpenAI, openai.summary),
       source: "openai_vision",
-      notes
+      notes: targetLockCtx ? [...notes, `target lock active: ${canonicalLabel(targetLockCtx.label)}`] : notes
     };
   }
 
@@ -1174,7 +1017,8 @@ function resetStateForInstruction(previous: VisionState, newHash: string): Visio
     scan_dir: 1,
     scan_ticks: 0,
     instruction_ctx: { hash: newHash },
-    motion_ctx: { consumed: false }
+    motion_ctx: { consumed: false },
+    target_lock_ctx: null
   };
 }
 
@@ -1222,10 +1066,11 @@ export async function POST(request: Request) {
       notes.push("instruction hash changed; state reset for immediate task switch");
     }
 
-    const perceptionResult = await analyzePerception(frameBase64, instruction, parsed);
+    const perceptionResult = await analyzePerception(frameBase64, instruction, parsed, state.target_lock_ctx);
     notes.push(...perceptionResult.notes);
 
     const output = buildPlanAndState(state, parsed, perceptionResult.perception);
+    output.state.target_lock_ctx = updateTargetLockCtx(state.target_lock_ctx, perceptionResult.perception.selected_target);
     const allowedTokenMap = buildAllowedTokenMap(body.system_manifest);
     const safePlan = sanitizePlanToManifest(output.plan, allowedTokenMap);
 
@@ -1238,7 +1083,13 @@ export async function POST(request: Request) {
           policy_branch: output.policyBranch,
           parsed_instruction: parsed,
           perception_source: perceptionResult.source,
-          notes: [...notes, ...output.notes],
+          notes: [
+            ...notes,
+            ...output.notes,
+            output.state.target_lock_ctx
+              ? `lock=${output.state.target_lock_ctx.label},lost=${output.state.target_lock_ctx.lost_ticks}`
+              : "lock=none"
+          ],
           manifest_guard: {
             enabled: Boolean(allowedTokenMap),
             dropped_steps: safePlan.dropped
