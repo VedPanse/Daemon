@@ -245,6 +245,12 @@ function App() {
   const [lastSentInstruction, setLastSentInstruction] = useState("");
   const [errorText, setErrorText] = useState("");
   const [chartSeries, setChartSeries] = useState([]);
+  const [orchestratorBaseUrl, setOrchestratorBaseUrl] = useState(ORCH_BASE_URL);
+  const [nodeEndpoints, setNodeEndpoints] = useState("base=vporto26.local:8765");
+  const [orchestratorProc, setOrchestratorProc] = useState({ running: false, pid: null, httpBaseUrl: null, args: null });
+  const [nodeProbeResults, setNodeProbeResults] = useState([]);
+  const [hardwareBusy, setHardwareBusy] = useState(false);
+  const [capabilities, setCapabilities] = useState(INITIAL_STATE.capabilities);
 
   const promptReady = taskPrompt.trim().length > 0;
   const draftReady = draftPrompt.trim().length > 0;
@@ -287,7 +293,7 @@ function App() {
 
     const poll = async () => {
       try {
-        await orchestratorStatus(ORCH_BASE_URL);
+        await orchestratorStatus(orchestratorBaseUrl);
         if (!cancelled) {
           setOrchestratorReachable(true);
           setLastOrchestratorError("");
@@ -298,6 +304,15 @@ function App() {
           setLastOrchestratorError(String(error));
         }
       }
+
+      if (RUNTIME_IS_TAURI && !cancelled) {
+        try {
+          const proc = await invoke("orchestrator_process_status");
+          setOrchestratorProc(proc);
+        } catch {
+          // Ignore.
+        }
+      }
     };
 
     poll();
@@ -306,7 +321,101 @@ function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [orchestratorBaseUrl]);
+
+  const parseNodeEndpoints = () => {
+    return nodeEndpoints
+      .split(/\r?\n|,/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  };
+
+  const probeNodes = async () => {
+    if (!RUNTIME_IS_TAURI) {
+      setErrorText("Node probe requires Tauri runtime.");
+      return;
+    }
+
+    setHardwareBusy(true);
+    try {
+      const endpoints = parseNodeEndpoints();
+      const results = [];
+      for (const entry of endpoints) {
+        const match = entry.match(/^[^=]+=([^:]+):(\d+)$/);
+        if (!match) {
+          results.push({ entry, ok: false, error: "Expected format alias=host:port" });
+          continue;
+        }
+        const host = match[1];
+        const port = Number.parseInt(match[2], 10);
+        const resp = await invoke("node_probe", { host, port });
+        results.push({ entry, ...resp });
+      }
+      setNodeProbeResults(results);
+
+      const firstOk = results.find((item) => item?.ok);
+      if (firstOk) {
+        const alias = String(firstOk.entry || "").split("=", 1)[0] || "base";
+        const tokens = Array.isArray(firstOk.tokens) ? firstOk.tokens.map((t) => String(t).toUpperCase()) : [];
+        setCapabilities((prev) => ({
+          ...prev,
+          base_target: alias,
+          base_fwd_token: tokens.includes("FWD") ? "FWD" : prev.base_fwd_token,
+          base_turn_token: tokens.includes("TURN") ? "TURN" : prev.base_turn_token
+        }));
+      }
+
+      setErrorText("");
+    } catch (error) {
+      setErrorText(`Probe failed: ${String(error)}`);
+    } finally {
+      setHardwareBusy(false);
+    }
+  };
+
+  const startOrchestrator = async () => {
+    if (!RUNTIME_IS_TAURI) {
+      setErrorText("Starting orchestrator requires Tauri runtime.");
+      return;
+    }
+
+    setHardwareBusy(true);
+    try {
+      const nodes = parseNodeEndpoints();
+      const proc = await invoke("orchestrator_spawn", {
+        nodes,
+        httpPort: 5055,
+        httpHost: "127.0.0.1"
+      });
+      setOrchestratorProc(proc);
+      if (proc?.httpBaseUrl) {
+        setOrchestratorBaseUrl(proc.httpBaseUrl);
+      }
+      setErrorText("");
+    } catch (error) {
+      setErrorText(`Start orchestrator failed: ${String(error)}`);
+    } finally {
+      setHardwareBusy(false);
+    }
+  };
+
+  const stopOrchestratorProcess = async () => {
+    if (!RUNTIME_IS_TAURI) {
+      setErrorText("Stopping orchestrator requires Tauri runtime.");
+      return;
+    }
+
+    setHardwareBusy(true);
+    try {
+      const proc = await invoke("orchestrator_stop_process");
+      setOrchestratorProc(proc);
+      setErrorText("");
+    } catch (error) {
+      setErrorText(`Stop orchestrator failed: ${String(error)}`);
+    } finally {
+      setHardwareBusy(false);
+    }
+  };
 
   const clearLiveTimer = () => {
     if (liveTimerRef.current) {
@@ -363,7 +472,7 @@ function App() {
     }
 
     try {
-      await orchestratorStop(ORCH_BASE_URL);
+      await orchestratorStop(orchestratorBaseUrl);
       setOrchestratorReachable(true);
       setLastOrchestratorError("");
       setLastActionText("STOP OK");
@@ -447,7 +556,7 @@ function App() {
       setErrorText("");
 
       if (executePlan) {
-        const response = await orchestratorExecutePlan(ORCH_BASE_URL, nextPlan);
+        const response = await orchestratorExecutePlan(orchestratorBaseUrl, nextPlan);
         if (!response?.ok) {
           throw new Error(response?.error || "execute_plan returned non-ok response");
         }
@@ -483,8 +592,9 @@ function App() {
   const startLiveCamera = async () => {
     try {
       await ensureCamera();
-      setFsmState(INITIAL_STATE);
-      stateRef.current = INITIAL_STATE;
+      const seeded = { ...INITIAL_STATE, capabilities };
+      setFsmState(seeded);
+      stateRef.current = seeded;
       setPerception(null);
       setLastPlan([]);
       setLastDebug(null);
@@ -542,6 +652,55 @@ function App() {
       </div>
 
       <section className="prompt-card">
+        <label>Hardware / Orchestrator</label>
+        <div className="prompt-row">
+          <textarea
+            value={nodeEndpoints}
+            onChange={(event) => setNodeEndpoints(event.target.value)}
+            rows={3}
+            style={{ flex: 1, minWidth: 320 }}
+            placeholder={"base=vporto26.local:8765\narm=127.0.0.1:7778"}
+          />
+          <button className="secondary" onClick={probeNodes} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Probe</button>
+          <button className="secondary" onClick={startOrchestrator} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>
+            Start Orchestrator
+          </button>
+          <button className="ghost" onClick={stopOrchestratorProcess} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Stop</button>
+        </div>
+        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>caps:</span>
+          <span>base_target</span>
+          <input
+            value={capabilities.base_target}
+            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_target: event.target.value }))}
+            style={{ width: 90 }}
+          />
+          <span>base_fwd_token</span>
+          <input
+            value={capabilities.base_fwd_token}
+            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_fwd_token: event.target.value }))}
+            style={{ width: 90 }}
+          />
+          <span>base_turn_token</span>
+          <input
+            value={capabilities.base_turn_token}
+            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_turn_token: event.target.value }))}
+            style={{ width: 90 }}
+          />
+        </div>
+        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>orchestrator:</span>
+          <input
+            value={orchestratorBaseUrl}
+            onChange={(event) => setOrchestratorBaseUrl(event.target.value)}
+            style={{ width: 320 }}
+          />
+          <span>{orchestratorProc?.running ? `pid=${orchestratorProc.pid}` : "not running (app can still talk to an external orchestrator)"}</span>
+        </div>
+        {nodeProbeResults.length ? <pre>{JSON.stringify(nodeProbeResults, null, 2)}</pre> : null}
+      </section>
+
+      <section className="prompt-card">
         <label htmlFor="taskPrompt">Task Prompt</label>
         <div className="prompt-row">
           <input
@@ -585,6 +744,7 @@ function App() {
       <section className="meta-grid">
         <div><strong>Runtime:</strong> {RUNTIME_IS_TAURI ? "Tauri" : "Browser fallback"}</div>
         <div><strong>Status:</strong> {statusText}</div>
+        <div><strong>Orchestrator:</strong> {orchestratorBaseUrl}</div>
         <div><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</div>
         <div><strong>Loop ms:</strong> {captureIntervalMs}</div>
         <div><strong>FPS:</strong> {captureIntervalMs > 0 ? (1000 / captureIntervalMs).toFixed(1) : "-"}</div>

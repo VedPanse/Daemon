@@ -68,3 +68,6 @@ desktop-app/src-tauri/target/
 # Node / frontend (web)
 web/node_modules/
 web/.next/
+
+# TypeScript incremental artifacts
+*.tsbuildinfo

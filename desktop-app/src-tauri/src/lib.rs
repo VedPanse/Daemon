@@ -1,7 +1,11 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use serialport::SerialPort;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::{fs::OpenOptions};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -16,9 +20,24 @@ struct SerialSession {
     port_name: String,
 }
 
+#[derive(Clone)]
+struct NodeManifestSummary {
+    raw: Value,
+    device_name: Option<String>,
+    node_id: Option<String>,
+    tokens: Vec<String>,
+}
+
+struct OrchestratorProcess {
+    child: Child,
+    args: Vec<String>,
+    http_base_url: String,
+}
+
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<SerialSession>>,
+    orchestrator_proc: Mutex<Option<OrchestratorProcess>>,
 }
 
 #[derive(Serialize)]
@@ -33,6 +52,28 @@ struct SerialPortEntry {
 struct ConnectionStatus {
     connected: bool,
     port_name: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorProcessStatus {
+    running: bool,
+    pid: Option<u32>,
+    http_base_url: Option<String>,
+    args: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeProbeStatus {
+    ok: bool,
+    host: String,
+    port: u16,
+    target: String,
+    device_name: Option<String>,
+    node_id: Option<String>,
+    tokens: Vec<String>,
+    manifest: Option<Value>,
 }
 
 fn port_type_name(port_type: &serialport::SerialPortType) -> String {
@@ -60,12 +101,143 @@ fn stop_session_locked(slot: &mut Option<SerialSession>) {
     }
 }
 
+fn stop_orchestrator_locked(slot: &mut Option<OrchestratorProcess>) {
+    if let Some(mut proc_) = slot.take() {
+        // Best-effort terminate. If this fails, we still drop the handle.
+        let _ = proc_.child.kill();
+        let _ = proc_.child.wait();
+    }
+}
+
 fn normalize_base_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("orchestrator_base_url is empty".to_string());
     }
     Ok(trimmed.to_string())
+}
+
+fn resolve_socket_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Failed to resolve {host}:{port}: {error}"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!("No addresses found for {host}:{port}"));
+    }
+    Ok(addrs)
+}
+
+fn find_repo_root() -> Result<PathBuf, String> {
+    // Tauri apps often start with a CWD that isn't the repo root. We search upward from:
+    // - current_exe()
+    // - current_dir()
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+
+    for start in candidates {
+        let mut cur: Option<&Path> = Some(start.as_path());
+        while let Some(dir) = cur {
+            let orch = dir.join("orchestrator").join("orchestrator.py");
+            if orch.exists() {
+                return Ok(dir.to_path_buf());
+            }
+            cur = dir.parent();
+        }
+    }
+
+    Err("Could not locate repo root (expected orchestrator/orchestrator.py). Run the app from the repo, or set VITE_ORCHESTRATOR_BASE_URL and start orchestrator manually.".to_string())
+}
+
+fn resolve_python3() -> String {
+    // GUI apps on macOS might not inherit the interactive shell PATH.
+    for candidate in ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"] {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "python3".to_string()
+}
+
+fn parse_manifest_summary(manifest: &Value) -> NodeManifestSummary {
+    let device_name = manifest
+        .get("device")
+        .and_then(|d| d.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let node_id = manifest
+        .get("device")
+        .and_then(|d| d.get("node_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(cmds) = manifest.get("commands").and_then(|v| v.as_array()) {
+        for cmd in cmds {
+            if let Some(tok) = cmd.get("token").and_then(|v| v.as_str()) {
+                tokens.push(tok.to_string());
+            }
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    NodeManifestSummary {
+        raw: manifest.clone(),
+        device_name,
+        node_id,
+        tokens,
+    }
+}
+
+fn probe_daemon_node(host: &str, port: u16) -> Result<NodeManifestSummary, String> {
+    let host_trimmed = host.trim();
+    if host_trimmed.is_empty() {
+        return Err("host cannot be empty".to_string());
+    }
+
+    let addrs = resolve_socket_addrs(host_trimmed, port)?;
+    let mut last_error = None;
+
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_nodelay(true);
+                stream
+                    .write_all(b"HELLO\n")
+                    .map_err(|error| format!("Node write failed: {error}"))?;
+                stream
+                    .flush()
+                    .map_err(|error| format!("Node flush failed: {error}"))?;
+
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .map_err(|error| format!("Node read failed: {error}"))?;
+                let line = line.trim().to_string();
+                if !line.starts_with("MANIFEST ") {
+                    return Err(format!("Expected MANIFEST from HELLO, got: {line}"));
+                }
+                let payload = line["MANIFEST ".len()..].trim();
+                let manifest: Value = serde_json::from_str(payload)
+                    .map_err(|error| format!("Invalid MANIFEST JSON: {error}"))?;
+                return Ok(parse_manifest_summary(&manifest));
+            }
+            Err(error) => {
+                last_error = Some(format!("Connect to {addr} failed: {error}"));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "Node connect failed".to_string()))
 }
 
 async fn orchestrator_request(
@@ -268,6 +440,186 @@ async fn orchestrator_stop(orchestrator_base_url: String) -> Result<Value, Strin
     .await
 }
 
+#[tauri::command]
+fn node_probe(host: String, port: u16) -> Result<NodeProbeStatus, String> {
+    let target = format!("{}:{}", host.trim(), port);
+    match probe_daemon_node(&host, port) {
+        Ok(summary) => Ok(NodeProbeStatus {
+            ok: true,
+            host: host.trim().to_string(),
+            port,
+            target,
+            device_name: summary.device_name,
+            node_id: summary.node_id,
+            tokens: summary.tokens,
+            manifest: Some(summary.raw),
+        }),
+        Err(error) => Ok(NodeProbeStatus {
+            ok: false,
+            host: host.trim().to_string(),
+            port,
+            target,
+            device_name: None,
+            node_id: None,
+            tokens: vec![],
+            manifest: Some(json!({ "error": error })),
+        }),
+    }
+}
+
+#[tauri::command]
+fn orchestrator_spawn(
+    state: State<'_, AppState>,
+    nodes: Vec<String>,
+    http_port: Option<u16>,
+    http_host: Option<String>,
+    planner_url: Option<String>,
+    step_timeout_s: Option<f64>,
+) -> Result<OrchestratorProcessStatus, String> {
+    let mut lock = state
+        .orchestrator_proc
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+
+    // If already running, return status.
+    if let Some(proc_) = &mut *lock {
+        if proc_.child.try_wait().map_err(|e| format!("Failed to query orchestrator process: {e}"))?.is_none() {
+            return Ok(OrchestratorProcessStatus {
+                running: true,
+                pid: Some(proc_.child.id()),
+                http_base_url: Some(proc_.http_base_url.clone()),
+                args: Some(proc_.args.clone()),
+            });
+        }
+        // Child exited; clear and continue to respawn.
+        *lock = None;
+    }
+
+    let http_port = http_port.unwrap_or(5055);
+    let http_host = http_host.unwrap_or_else(|| "127.0.0.1".to_string());
+    let repo_root = find_repo_root()?;
+    let orch_path = repo_root.join("orchestrator").join("orchestrator.py");
+    if !orch_path.exists() {
+        return Err(format!(
+            "orchestrator.py not found at {}",
+            orch_path.display()
+        ));
+    }
+
+    if nodes.is_empty() {
+        return Err("nodes must contain at least one entry like base=vporto26.local:8765".to_string());
+    }
+
+    let mut args: Vec<String> = Vec::new();
+    args.push(orch_path.to_string_lossy().to_string());
+    for node in &nodes {
+        let trimmed = node.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        args.push("--node".to_string());
+        args.push(trimmed.to_string());
+    }
+    if let Some(url) = planner_url.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        args.push("--planner-url".to_string());
+        args.push(url);
+    }
+    if let Some(step_timeout) = step_timeout_s {
+        args.push("--step-timeout".to_string());
+        args.push(format!("{step_timeout}"));
+    }
+    args.push("--http-host".to_string());
+    args.push(http_host.clone());
+    args.push("--http-port".to_string());
+    args.push(http_port.to_string());
+
+    let python3 = resolve_python3();
+    let mut cmd = Command::new(python3);
+
+    let log_path = repo_root.join(".build").join("orchestrator_desktop.log");
+    let _ = std::fs::create_dir_all(repo_root.join(".build"));
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open orchestrator log file {}: {e}", log_path.display()))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| format!("Failed to clone log file handle: {e}"))?;
+
+    cmd.args(&args)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err));
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to spawn orchestrator: {e}"))?;
+
+    let http_base_url = format!("http://{}:{}", http_host, http_port);
+    *lock = Some(OrchestratorProcess {
+        child,
+        args,
+        http_base_url: http_base_url.clone(),
+    });
+
+    Ok(OrchestratorProcessStatus {
+        running: true,
+        pid: lock.as_ref().map(|p| p.child.id()),
+        http_base_url: Some(http_base_url),
+        args: lock.as_ref().map(|p| p.args.clone()),
+    })
+}
+
+#[tauri::command]
+fn orchestrator_stop_process(state: State<'_, AppState>) -> Result<OrchestratorProcessStatus, String> {
+    let mut lock = state
+        .orchestrator_proc
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+    stop_orchestrator_locked(&mut lock);
+    Ok(OrchestratorProcessStatus {
+        running: false,
+        pid: None,
+        http_base_url: None,
+        args: None,
+    })
+}
+
+#[tauri::command]
+fn orchestrator_process_status(state: State<'_, AppState>) -> Result<OrchestratorProcessStatus, String> {
+    let mut lock = state
+        .orchestrator_proc
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+    if let Some(proc_) = &mut *lock {
+        match proc_.child.try_wait() {
+            Ok(None) => Ok(OrchestratorProcessStatus {
+                running: true,
+                pid: Some(proc_.child.id()),
+                http_base_url: Some(proc_.http_base_url.clone()),
+                args: Some(proc_.args.clone()),
+            }),
+            Ok(Some(_)) => {
+                *lock = None;
+                Ok(OrchestratorProcessStatus {
+                    running: false,
+                    pid: None,
+                    http_base_url: None,
+                    args: None,
+                })
+            }
+            Err(e) => Err(format!("Failed to query orchestrator process: {e}")),
+        }
+    } else {
+        Ok(OrchestratorProcessStatus {
+            running: false,
+            pid: None,
+            http_base_url: None,
+            args: None,
+        })
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -281,7 +633,11 @@ pub fn run() {
             send_serial_line,
             orchestrator_status,
             orchestrator_execute_plan,
-            orchestrator_stop
+            orchestrator_stop,
+            node_probe,
+            orchestrator_spawn,
+            orchestrator_stop_process,
+            orchestrator_process_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
