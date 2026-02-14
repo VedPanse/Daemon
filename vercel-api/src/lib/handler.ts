@@ -41,6 +41,10 @@ function parseBody(body: unknown): PlanRequest {
     throw new ValidationError("system_manifest must be an object.");
   }
 
+  if (typeof system_manifest.daemon_version !== "string" || !system_manifest.daemon_version.trim()) {
+    throw new ValidationError("system_manifest.daemon_version must be a non-empty string.");
+  }
+
   if (!Array.isArray(system_manifest.nodes)) {
     throw new ValidationError("system_manifest.nodes must be an array.");
   }
@@ -49,9 +53,41 @@ function parseBody(body: unknown): PlanRequest {
     throw new ValidationError("telemetry_snapshot must be an object.");
   }
 
+  const typedNodes: PlanRequest["system_manifest"]["nodes"] = system_manifest.nodes.map((node, index) => {
+    if (!isObject(node)) {
+      throw new ValidationError("Each system_manifest node must be an object.", { index, node });
+    }
+
+    if (typeof node.name !== "string" || !node.name.trim()) {
+      throw new ValidationError("Each node.name must be a non-empty string.", { index, node });
+    }
+
+    if (typeof node.node_id !== "string" || !node.node_id.trim()) {
+      throw new ValidationError("Each node.node_id must be a non-empty string.", { index, node });
+    }
+
+    if (!Array.isArray(node.commands)) {
+      throw new ValidationError("Each node.commands must be an array.", { index, node });
+    }
+
+    if (node.telemetry !== undefined && !isObject(node.telemetry)) {
+      throw new ValidationError("node.telemetry must be an object when provided.", { index, node });
+    }
+
+    return {
+      name: node.name,
+      node_id: node.node_id,
+      commands: node.commands,
+      ...(node.telemetry !== undefined ? { telemetry: node.telemetry } : {})
+    };
+  });
+
   return {
     instruction,
-    system_manifest: system_manifest as PlanRequest["system_manifest"],
+    system_manifest: {
+      daemon_version: system_manifest.daemon_version,
+      nodes: typedNodes
+    },
     telemetry_snapshot
   };
 }
