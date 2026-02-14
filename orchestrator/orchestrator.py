@@ -22,12 +22,14 @@ class NodeInfo:
     reader_thread: threading.Thread | None = None
     rx_queue: queue.Queue[str] = field(default_factory=queue.Queue)
     write_lock: threading.Lock = field(default_factory=threading.Lock)
+    request_lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = False
     manifest: dict[str, Any] = field(default_factory=dict)
     node_name: str = ""
     node_id: str = ""
     telemetry_snapshot: dict[str, str] = field(default_factory=dict)
     telemetry_subscribed: bool = False
+    read_buffer: bytearray = field(default_factory=bytearray)
 
 
 class Orchestrator:
@@ -71,12 +73,25 @@ class Orchestrator:
 
     def _reader_loop(self, node: NodeInfo) -> None:
         assert node.sock is not None
-        with node.sock, node.sock.makefile("r", encoding="utf-8", newline="\n") as reader:
-            while node.running:
-                raw = reader.readline()
-                if not raw:
+        sock = node.sock
+        while node.running:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
                     break
-                line = raw.strip()
+                node.read_buffer.extend(chunk)
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+
+            while True:
+                newline = node.read_buffer.find(b"\n")
+                if newline < 0:
+                    break
+                raw = bytes(node.read_buffer[:newline])
+                del node.read_buffer[: newline + 1]
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
 
@@ -97,8 +112,9 @@ class Orchestrator:
     def _connect_node(self, node: NodeInfo) -> None:
         node.sock = socket.create_connection((node.host, node.port), timeout=self.timeout_s)
         node.running = True
-        node.reader_thread = threading.Thread(target=self._reader_loop, args=(node,), daemon=True)
-        node.reader_thread.start()
+        if self.enable_telemetry:
+            node.reader_thread = threading.Thread(target=self._reader_loop, args=(node,), daemon=True)
+            node.reader_thread.start()
 
         hello_line = self._request(node, "HELLO")
         if not hello_line.startswith("MANIFEST "):
@@ -120,15 +136,63 @@ class Orchestrator:
             f"{','.join(cmd.get('token', '') for cmd in manifest.get('commands', []))}"
         )
 
-    def _request(self, node: NodeInfo, line: str, timeout: float | None = None) -> str:
+    def _readline_direct(self, node: NodeInfo, timeout: float) -> str:
         assert node.sock is not None
-        with node.write_lock:
-            node.sock.sendall((line + "\n").encode("utf-8"))
+        sock = node.sock
+        previous_timeout = sock.gettimeout()
         try:
-            wait = self.timeout_s if timeout is None else timeout
-            return node.rx_queue.get(timeout=wait)
-        except queue.Empty as exc:
-            raise RuntimeError(f"{node.alias}: timeout waiting for response to '{line}'") from exc
+            sock.settimeout(timeout)
+            while True:
+                newline = node.read_buffer.find(b"\n")
+                if newline >= 0:
+                    raw = bytes(node.read_buffer[:newline])
+                    del node.read_buffer[: newline + 1]
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line.startswith("TELEMETRY "):
+                        payload = line[len("TELEMETRY ") :].strip()
+                        for pair in payload.split():
+                            if "=" in pair:
+                                k, v = pair.split("=", 1)
+                                node.telemetry_snapshot[k] = v
+                        if self.enable_telemetry:
+                            print(f"[{node.alias}] {line}")
+                        continue
+                    return line
+
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError(f"{node.alias}: connection closed while waiting for response")
+                node.read_buffer.extend(chunk)
+        except TimeoutError as exc:
+            raise RuntimeError(f"{node.alias}: timeout waiting for response") from exc
+        except OSError as exc:
+            raise RuntimeError(f"{node.alias}: socket error while waiting for response: {exc}") from exc
+        finally:
+            try:
+                sock.settimeout(previous_timeout)
+            except OSError:
+                pass
+
+    def _request(self, node: NodeInfo, line: str, timeout: float | None = None) -> str:
+        if node.sock is None:
+            raise RuntimeError(f"{node.alias}: not connected")
+
+        wait = self.timeout_s if timeout is None else timeout
+        with node.request_lock:
+            try:
+                with node.write_lock:
+                    node.sock.sendall((line + "\n").encode("utf-8"))
+            except OSError as exc:
+                raise RuntimeError(f"{node.alias}: socket error sending '{line}': {exc}") from exc
+
+            if self.enable_telemetry:
+                try:
+                    return node.rx_queue.get(timeout=wait)
+                except queue.Empty as exc:
+                    raise RuntimeError(f"{node.alias}: timeout waiting for response to '{line}'") from exc
+            return self._readline_direct(node, wait)
 
     def _build_catalogs(self) -> None:
         first_owner: dict[str, NodeInfo] = {}
@@ -369,16 +433,16 @@ class Orchestrator:
                 raise RuntimeError(f"step[{index}] failed: {exc}; panic STOP sent") from exc
 
     def emergency_stop(self) -> None:
-        errors: list[str] = []
         for node in self.nodes:
             try:
+                if node.sock is None:
+                    print(f"stop warning [{node.alias}]: socket not connected")
+                    continue
                 response = self._request(node, "STOP", timeout=0.8)
                 if response != "OK":
-                    errors.append(f"{node.alias}:{response}")
+                    print(f"stop warning [{node.alias}]: {response}")
             except Exception as exc:
-                errors.append(f"{node.alias}:{exc}")
-        if errors:
-            raise RuntimeError("Emergency stop failures: " + ", ".join(errors))
+                print(f"stop warning [{node.alias}]: {exc}")
 
 
 def parse_node_arg(raw: str) -> NodeInfo:
