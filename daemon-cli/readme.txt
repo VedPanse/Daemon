@@ -20,7 +20,9 @@ What `daemon build` does:
 
 Environment requirements:
 
-- `OPENAI_API_KEY` must be set
+- Set `OPENAI_API_KEY` or `OPEN_AI_API_KEY`
+- The CLI will also read these keys from a `.env` file in the current directory
+  or parent directories
 
 Optional flags:
 

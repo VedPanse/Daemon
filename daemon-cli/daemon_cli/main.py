@@ -94,7 +94,8 @@ def handle_build(args: argparse.Namespace) -> None:
     if not context.strip():
         fail(f"No text files found in {firmware_dir}")
 
-    client = OpenAI()
+    api_key = resolve_openai_api_key()
+    client = OpenAI(api_key=api_key)
     prompt = build_user_prompt(firmware_dir, context)
 
     response = client.responses.create(
@@ -227,6 +228,54 @@ def parse_json_output(response: object) -> dict[str, str]:
 
     fail("Could not parse JSON output from model response")
     raise AssertionError("unreachable")
+
+
+def resolve_openai_api_key() -> str:
+    key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPEN_AI_API_KEY")
+    if key:
+        return key
+
+    for env_file in find_env_files():
+        env_vars = parse_dotenv(env_file)
+        key = env_vars.get("OPENAI_API_KEY") or env_vars.get("OPEN_AI_API_KEY")
+        if key:
+            return key
+
+    fail("Missing OpenAI API key. Set OPENAI_API_KEY or OPEN_AI_API_KEY (env or .env).")
+    raise AssertionError("unreachable")
+
+
+def find_env_files() -> list[Path]:
+    files: list[Path] = []
+    for parent in [Path.cwd(), *Path.cwd().parents]:
+        candidate = parent / ".env"
+        if candidate.exists() and candidate.is_file():
+            files.append(candidate)
+    return files
+
+
+def parse_dotenv(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+
+        result[key] = value
+
+    return result
 
 
 def fail(message: str) -> None:
