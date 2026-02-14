@@ -1,0 +1,31 @@
+schema_version: "1.0"
+daemon:
+  config_id: "greenhouse_node-20260214t070742z-72d9d5"
+  profile: "greenhouse_node"
+  created_at: "2026-02-14T07:07:42.050235Z"
+  safety:
+    min_target_humidity_pct: 35
+    max_target_humidity_pct: 85
+transport:
+  command_ingress:
+    type: mqtt_json
+    topic: "daemon/greenhouse/cmd"
+  telemetry_egress:
+    type: mqtt_json
+    topic: "daemon/greenhouse/events"
+command_direction_mapping:
+  climate.set_target_humidity:
+    function: daemon_set_target_humidity
+    args:
+      humidity_pct: float
+  irrigation.manual_override:
+    function: daemon_set_irrigation_override
+    args:
+      enabled: bool
+      duration_s: int
+telemetry:
+  events:
+    - id: telemetry.climate
+      fields: [temp_c, humidity_pct, soil_moisture_pct]
+    - id: alert.sensor_fault
+      fields: [sensor_name, error_code]

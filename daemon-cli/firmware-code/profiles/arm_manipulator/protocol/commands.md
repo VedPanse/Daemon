@@ -1,0 +1,4 @@
+- arm.home
+- arm.stop
+- arm.move_joint (joint_id, angle_deg, duration_s)
+- arm.execute_trajectory (segments[])

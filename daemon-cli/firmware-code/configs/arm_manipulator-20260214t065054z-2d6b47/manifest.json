@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0",
+  "config_id": "arm_manipulator-20260214t065054z-2d6b47",
+  "profile": "arm_manipulator",
+  "created_at": "2026-02-14T06:50:54.661665Z",
+  "generation_mode": "template",
+  "model": null,
+  "context": {
+    "source_dir": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/profiles/arm_manipulator",
+    "file_count": 5,
+    "files": [
+      "README.md",
+      "protocol/commands.md",
+      "src/joint_limits.c",
+      "src/joint_limits.h",
+      "src/motion_queue.c"
+    ],
+    "sha256": "32f56506757ec3b3c812060d67d60c6b0d6c5e2cabbcfaddb017d975f7f3303d"
+  },
+  "artifacts": {
+    "config_dir": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/arm_manipulator-20260214t065054z-2d6b47",
+    "daemon_yaml_path": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/arm_manipulator-20260214t065054z-2d6b47/DAEMON.yaml",
+    "daemon_entry_path": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/arm_manipulator-20260214t065054z-2d6b47/daemon_entry.c"
+  },
+  "api_target": {
+    "collection": "daemon-configs",
+    "subfolder": "arm_manipulator-20260214t065054z-2d6b47"
+  }
+}

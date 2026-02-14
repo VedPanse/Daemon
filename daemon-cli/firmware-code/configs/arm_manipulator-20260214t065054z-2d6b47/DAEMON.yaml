@@ -1,0 +1,26 @@
+schema_version: "1.0"
+daemon:
+  config_id: "arm_manipulator-20260214t065054z-2d6b47"
+  profile: "arm_manipulator"
+  created_at: "2026-02-14T06:50:54.660786Z"
+  safety:
+    enforce_joint_limits: true
+    max_segment_duration_s: 10
+transport:
+  command_ingress:
+    type: grpc
+    service: "daemon.arm.CommandService"
+  telemetry_egress:
+    type: grpc_stream
+    stream: "daemon.arm.TelemetryStream"
+command_direction_mapping:
+  arm.home:
+    function: daemon_arm_home
+  arm.stop:
+    function: daemon_arm_stop
+  arm.move_joint:
+    function: daemon_arm_move_joint
+    args:
+      joint_id: int
+      angle_deg: float
+      duration_s: float
