@@ -27,7 +27,6 @@ async function persistToBlob(basePath: string, body: IngestBody): Promise<Upload
   const manifestBlob = await put(`${basePath}/manifest.json`, JSON.stringify(body.manifest, null, 2), {
     access: "public",
     addRandomSuffix: false,
-    allowOverwrite: true,
     contentType: "application/json"
   });
   uploaded.push({ name: "manifest.json", url: manifestBlob.url });
@@ -35,7 +34,6 @@ async function persistToBlob(basePath: string, body: IngestBody): Promise<Upload
   const yamlBlob = await put(`${basePath}/DAEMON.yaml`, body.artifacts["DAEMON.yaml"], {
     access: "public",
     addRandomSuffix: false,
-    allowOverwrite: true,
     contentType: "text/yaml"
   });
   uploaded.push({ name: "DAEMON.yaml", url: yamlBlob.url });
@@ -43,7 +41,6 @@ async function persistToBlob(basePath: string, body: IngestBody): Promise<Upload
   const cBlob = await put(`${basePath}/daemon_entry.c`, body.artifacts["daemon_entry.c"], {
     access: "public",
     addRandomSuffix: false,
-    allowOverwrite: true,
     contentType: "text/x-c"
   });
   uploaded.push({ name: "daemon_entry.c", url: cBlob.url });
