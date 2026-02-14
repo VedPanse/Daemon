@@ -3,6 +3,23 @@ import jpeg from "jpeg-js";
 
 export const runtime = "nodejs";
 
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:1420",
+  "http://127.0.0.1:1420",
+  "tauri://localhost"
+]);
+
+function corsHeaders(origin: string | null): HeadersInit {
+  const allowedOrigin = origin && ALLOWED_ORIGINS.has(origin) ? origin : "*";
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin"
+  };
+}
+
 type Stage = "SEARCH" | "ALIGN" | "APPROACH" | "FINAL_ALIGN" | "GRAB" | "DONE";
 
 type PlanStep =
@@ -397,27 +414,35 @@ function buildPlanAndState(previous: VisionState, perception: Perception) {
   };
 }
 
+export async function OPTIONS(request: Request) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: corsHeaders(request.headers.get("origin"))
+  });
+}
+
 export async function POST(request: Request) {
+  const headers = corsHeaders(request.headers.get("origin"));
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "BAD_REQUEST", message: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ error: "BAD_REQUEST", message: "Invalid JSON body" }, { status: 400, headers });
   }
 
   if (!isObject(body)) {
-    return NextResponse.json({ error: "BAD_REQUEST", message: "Body must be a JSON object" }, { status: 400 });
+    return NextResponse.json({ error: "BAD_REQUEST", message: "Body must be a JSON object" }, { status: 400, headers });
   }
 
   const frameBase64 = body.frame_jpeg_base64;
   const instruction = body.instruction;
 
   if (typeof frameBase64 !== "string" || frameBase64.length < 20) {
-    return NextResponse.json({ error: "BAD_REQUEST", message: "frame_jpeg_base64 is required" }, { status: 400 });
+    return NextResponse.json({ error: "BAD_REQUEST", message: "frame_jpeg_base64 is required" }, { status: 400, headers });
   }
 
   if (typeof instruction !== "string" || !instruction.trim()) {
-    return NextResponse.json({ error: "BAD_REQUEST", message: "instruction is required" }, { status: 400 });
+    return NextResponse.json({ error: "BAD_REQUEST", message: "instruction is required" }, { status: 400, headers });
   }
 
   try {
@@ -432,7 +457,7 @@ export async function POST(request: Request) {
         plan: output.plan,
         debug: output.debug
       },
-      { status: 200 }
+      { status: 200, headers }
     );
   } catch (error) {
     return NextResponse.json(
@@ -440,7 +465,7 @@ export async function POST(request: Request) {
         error: "VISION_ERROR",
         message: error instanceof Error ? error.message : "failed to process frame"
       },
-      { status: 400 }
+      { status: 400, headers }
     );
   }
 }
