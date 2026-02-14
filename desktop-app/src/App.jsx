@@ -246,7 +246,8 @@ function App() {
   const [errorText, setErrorText] = useState("");
   const [chartSeries, setChartSeries] = useState([]);
   const [orchestratorBaseUrl, setOrchestratorBaseUrl] = useState(ORCH_BASE_URL);
-  const [nodeEndpoints, setNodeEndpoints] = useState("base=vporto26.local:8765");
+  // Default to 8766 because 8765 is commonly used by the legacy JSON mecanum bridge.
+  const [nodeEndpoints, setNodeEndpoints] = useState("base=vporto26.local:8766");
   const [orchestratorProc, setOrchestratorProc] = useState({ running: false, pid: null, httpBaseUrl: null, args: null });
   const [nodeProbeResults, setNodeProbeResults] = useState([]);
   const [hardwareBusy, setHardwareBusy] = useState(false);
@@ -292,6 +293,9 @@ function App() {
     let cancelled = false;
 
     const poll = async () => {
+      // If the orchestrator isn't expected to be running, don't spam an error.
+      // The desktop app can still talk to an external orchestrator if the user starts it manually.
+      const shouldReportOrchError = Boolean(orchestratorProc?.running) || orchestratorBaseUrl.trim() !== ORCH_BASE_URL.trim();
       try {
         await orchestratorStatus(orchestratorBaseUrl);
         if (!cancelled) {
@@ -301,7 +305,7 @@ function App() {
       } catch (error) {
         if (!cancelled) {
           setOrchestratorReachable(false);
-          setLastOrchestratorError(String(error));
+          setLastOrchestratorError(shouldReportOrchError ? String(error) : "");
         }
       }
 
