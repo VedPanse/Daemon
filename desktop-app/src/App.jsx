@@ -1,486 +1,346 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import "./App.css";
 
-const CHATS_KEY = "daemon_chat_sessions_v1";
-const STREAM_EVENT = "chat_stream_event";
-const CONTEXT_LIMIT = 24;
+const SERIAL_EVENT = "serial_line";
 
-function makeId() {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) {
-    return crypto.randomUUID();
+function parseManifestPayload(rawPayload) {
+  const payload = rawPayload.trim();
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    // Continue to base64 fallback.
   }
 
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function clampTitle(text) {
-  const clean = text.trim().replace(/\s+/g, " ");
-  if (!clean) {
-    return "New Chat";
+  try {
+    const decoded = atob(payload);
+    return JSON.parse(decoded);
+  } catch {
+    return null;
   }
-  return clean.length > 42 ? `${clean.slice(0, 42)}...` : clean;
 }
 
-function formatSidebarTime(unixMs) {
-  const date = new Date(unixMs);
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+function scoreCommand(part, command) {
+  const q = part.toLowerCase();
+  let score = 0;
+
+  const tokenWords = (command.token || "").toLowerCase().split("_");
+  if (tokenWords.every((word) => q.includes(word))) {
+    score += 5;
+  }
+
+  if ((command.desc || "").toLowerCase().split(" ").some((word) => word && q.includes(word))) {
+    score += 3;
+  }
+
+  const synonyms = command.nlp?.synonyms || [];
+  for (const synonym of synonyms) {
+    if (q.includes(String(synonym).toLowerCase())) {
+      score += 4;
+    }
+  }
+
+  return score;
+}
+
+function extractNumbers(text) {
+  const matches = text.match(/-?\d+(?:\.\d+)?/g);
+  return matches ? matches.map((piece) => Number(piece)) : [];
+}
+
+function planCommands(prompt, manifest) {
+  const commands = manifest?.commands || [];
+  if (!commands.length) {
+    return [];
+  }
+
+  const normalized = prompt.trim().toLowerCase();
+  if (!normalized) {
+    return [];
+  }
+
+  if (normalized.includes("stop")) {
+    return [{ token: "STOP", args: [] }];
+  }
+
+  const parts = normalized.split(/\bthen\b|\band then\b|,/).map((part) => part.trim()).filter(Boolean);
+  const numbers = extractNumbers(normalized);
+  let numberIndex = 0;
+
+  const plan = [];
+  for (const part of parts) {
+    let best = null;
+    for (const command of commands) {
+      const score = scoreCommand(part, command);
+      if (score > 0 && (!best || score > best.score)) {
+        best = { command, score };
+      }
+    }
+
+    if (!best) {
+      continue;
+    }
+
+    const args = [];
+    for (const arg of best.command.args || []) {
+      if (numberIndex < numbers.length) {
+        args.push(numbers[numberIndex]);
+        numberIndex += 1;
+      } else if (arg.min !== null && arg.min !== undefined) {
+        args.push(arg.min);
+      } else {
+        args.push(0);
+      }
+    }
+
+    plan.push({ token: best.command.token, args });
+  }
+
+  return plan;
 }
 
 function App() {
-  const [chats, setChats] = useState([]);
-  const [activeChatId, setActiveChatId] = useState(null);
+  const [ports, setPorts] = useState([]);
+  const [selectedPort, setSelectedPort] = useState("");
+  const [connectedPort, setConnectedPort] = useState("");
+  const [manifest, setManifest] = useState(null);
+  const [telemetry, setTelemetry] = useState([]);
+  const [wireLog, setWireLog] = useState([]);
+  const [chat, setChat] = useState([]);
   const [draft, setDraft] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
   const [errorText, setErrorText] = useState("");
-  const [chatSearch, setChatSearch] = useState("");
-  const scrollRef = useRef(null);
-  const streamRef = useRef(null);
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
+  const catalog = useMemo(() => manifest?.commands || [], [manifest]);
+
+  const pushLog = (line) => {
+    setWireLog((prev) => [...prev.slice(-199), line]);
+  };
+
+  const refreshPorts = async () => {
     try {
-      const raw = localStorage.getItem(CHATS_KEY);
-      if (!raw) {
-        return;
+      const result = await invoke("list_serial_ports");
+      setPorts(result);
+      if (!selectedPort && result.length > 0) {
+        setSelectedPort(result[0].portName);
       }
-
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        return;
-      }
-
-      const hydrated = parsed
-        .filter((chat) => chat && Array.isArray(chat.messages))
-        .map((chat) => ({
-          id: typeof chat.id === "string" ? chat.id : makeId(),
-          title: typeof chat.title === "string" ? chat.title : "New Chat",
-          createdAt: Number(chat.createdAt) || Date.now(),
-          updatedAt: Number(chat.updatedAt) || Date.now(),
-          messages: chat.messages
-            .filter(
-              (message) =>
-                message &&
-                typeof message.role === "string" &&
-                typeof message.content === "string",
-            )
-            .map((message) => ({
-              id: typeof message.id === "string" ? message.id : makeId(),
-              role: message.role,
-              content: message.content,
-              pending: false,
-              requestId: null,
-            })),
-        }))
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-
-      setChats(hydrated);
-    } catch {
-      localStorage.removeItem(CHATS_KEY);
+      setErrorText("");
+    } catch (error) {
+      setErrorText(String(error));
     }
-  }, []);
+  };
 
   useEffect(() => {
-    const serializable = chats.map(({ id, title, createdAt, updatedAt, messages }) => ({
-      id,
-      title,
-      createdAt,
-      updatedAt,
-      messages: messages.map(({ id: messageId, role, content }) => ({
-        id: messageId,
-        role,
-        content,
-      })),
-    }));
-    localStorage.setItem(CHATS_KEY, JSON.stringify(serializable));
-  }, [chats]);
+    refreshPorts();
 
-  const activeChat = useMemo(
-    () => chats.find((chat) => chat.id === activeChatId) ?? null,
-    [activeChatId, chats],
-  );
-  const activeMessages = activeChat?.messages ?? [];
-
-  const filteredChats = useMemo(() => {
-    const query = chatSearch.trim().toLowerCase();
-    if (!query) {
-      return chats;
-    }
-    return chats.filter((chat) => chat.title.toLowerCase().includes(query));
-  }, [chatSearch, chats]);
-
-  useEffect(() => {
-    const target = scrollRef.current;
-    if (!target || !activeChatId) {
-      return;
-    }
-    target.scrollTop = target.scrollHeight;
-  }, [activeChatId, activeMessages, isStreaming]);
-
-  useEffect(() => {
     let unlisten;
-    let active = true;
-
-    listen(STREAM_EVENT, (event) => {
-      if (!active) {
+    listen(SERIAL_EVENT, (event) => {
+      const line = String(event.payload || "").trim();
+      if (!line) {
         return;
       }
 
-      const payload = event.payload;
-      const stream = streamRef.current;
-      if (!stream || !payload || payload.requestId !== stream.requestId) {
-        return;
+      pushLog(line);
+
+      if (line.startsWith("MANIFEST ")) {
+        const payload = line.slice("MANIFEST ".length);
+        const parsed = parseManifestPayload(payload);
+        if (parsed && Array.isArray(parsed.commands)) {
+          setManifest(parsed);
+          setChat((prev) => [...prev, { role: "assistant", content: `Manifest loaded (${parsed.commands.length} commands).` }]);
+        } else {
+          setChat((prev) => [...prev, { role: "assistant", content: "Manifest payload could not be parsed." }]);
+        }
+      } else if (line.startsWith("TELEMETRY ")) {
+        setTelemetry((prev) => [...prev.slice(-99), line.slice("TELEMETRY ".length)]);
+      } else if (line.startsWith("ERR ")) {
+        setChat((prev) => [...prev, { role: "assistant", content: `Device error: ${line}` }]);
       }
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
 
-      if (payload.kind === "delta" && typeof payload.delta === "string") {
-        setChats((prev) =>
-          prev.map((chat) => {
-            if (chat.id !== stream.chatId) {
-              return chat;
-            }
-
-            return {
-              ...chat,
-              updatedAt: Date.now(),
-              messages: chat.messages.map((message) =>
-                message.requestId === payload.requestId
-                  ? { ...message, content: `${message.content}${payload.delta}` }
-                  : message,
-              ),
-            };
-          }),
-        );
-      }
-
-      if (payload.kind === "done") {
-        setIsStreaming(false);
-        streamRef.current = null;
-        setChats((prev) =>
-          prev
-            .map((chat) => {
-              if (chat.id !== stream.chatId) {
-                return chat;
-              }
-
-              return {
-                ...chat,
-                updatedAt: Date.now(),
-                messages: chat.messages.map((message) =>
-                  message.requestId === payload.requestId
-                    ? { ...message, pending: false, requestId: null }
-                    : message,
-                ),
-              };
-            })
-            .sort((a, b) => b.updatedAt - a.updatedAt),
-        );
-      }
-    })
-      .then((cleanup) => {
-        unlisten = cleanup;
+    invoke("get_connection_status")
+      .then((status) => {
+        if (status.connected && status.portName) {
+          setConnectedPort(status.portName);
+        }
       })
-      .catch(() => {
-        setErrorText("Unable to connect to stream events.");
-      });
+      .catch(() => {});
 
     return () => {
-      active = false;
       if (unlisten) {
         unlisten();
       }
     };
   }, []);
 
-  const startNewChat = () => {
-    if (isStreaming) {
-      return;
-    }
-    setActiveChatId(null);
-    setErrorText("");
-    setDraft("");
-  };
-
-  const deleteChat = (chatId) => {
-    if (isStreaming) {
-      return;
-    }
-    setChats((prev) => prev.filter((chat) => chat.id !== chatId));
-    if (activeChatId === chatId) {
-      setActiveChatId(null);
-      setErrorText("");
-    }
-  };
-
-  const sendPrompt = async () => {
-    const prompt = draft.trim();
-    if (!prompt || isStreaming) {
+  const connect = async () => {
+    if (!selectedPort) {
+      setErrorText("Select a serial port first.");
       return;
     }
 
-    setDraft("");
-    setErrorText("");
-
-    const now = Date.now();
-    const requestId = makeId();
-    const userMessage = {
-      id: makeId(),
-      role: "user",
-      content: prompt,
-      pending: false,
-      requestId: null,
-    };
-    const assistantMessage = {
-      id: makeId(),
-      role: "assistant",
-      content: "",
-      pending: true,
-      requestId,
-    };
-
-    let targetChatId = activeChatId;
-    if (!targetChatId) {
-      targetChatId = makeId();
-      const newChat = {
-        id: targetChatId,
-        title: clampTitle(prompt),
-        createdAt: now,
-        updatedAt: now,
-        messages: [userMessage, assistantMessage],
-      };
-      setChats((prev) => [newChat, ...prev]);
-      setActiveChatId(targetChatId);
-    } else {
-      setChats((prev) =>
-        prev
-          .map((chat) => {
-            if (chat.id !== targetChatId) {
-              return chat;
-            }
-
-            const title = chat.messages.length === 0 ? clampTitle(prompt) : chat.title;
-            return {
-              ...chat,
-              title,
-              updatedAt: now,
-              messages: [...chat.messages, userMessage, assistantMessage],
-            };
-          })
-          .sort((a, b) => b.updatedAt - a.updatedAt),
-      );
-    }
-
-    const baseMessages =
-      activeChat?.id === targetChatId
-        ? activeChat.messages
-        : chats.find((chat) => chat.id === targetChatId)?.messages ?? [];
-
-    const contextMessages = [...baseMessages, userMessage]
-      .filter((message) => message.role === "user" || message.role === "assistant")
-      .slice(-CONTEXT_LIMIT)
-      .map(({ role, content }) => ({ role, content }));
-
-    setIsStreaming(true);
-    streamRef.current = { requestId, chatId: targetChatId };
-
+    setBusy(true);
     try {
-      await invoke("stream_chat", {
-        request: {
-          requestId,
-          model: "gpt-4o-mini",
-          messages: contextMessages,
-        },
-      });
+      const status = await invoke("connect_serial", { portName: selectedPort, baudRate: 115200 });
+      if (status.connected) {
+        setConnectedPort(status.portName || selectedPort);
+        setManifest(null);
+        setTelemetry([]);
+        setWireLog([]);
+        await invoke("send_serial_line", { line: "HELLO" });
+        await invoke("send_serial_line", { line: "READ_MANIFEST" });
+        setChat((prev) => [...prev, { role: "assistant", content: `Connected to ${selectedPort}. Requested manifest.` }]);
+      }
+      setErrorText("");
     } catch (error) {
-      const message = typeof error === "string" ? error : "Request failed.";
-      setErrorText(message);
-      setIsStreaming(false);
-      streamRef.current = null;
-      setChats((prev) =>
-        prev.map((chat) => {
-          if (chat.id !== targetChatId) {
-            return chat;
-          }
-          return {
-            ...chat,
-            messages: chat.messages.map((entry) =>
-              entry.requestId === requestId
-                ? {
-                    ...entry,
-                    pending: false,
-                    requestId: null,
-                    content: "I hit an error while contacting the model.",
-                  }
-                : entry,
-            ),
-          };
-        }),
-      );
+      setErrorText(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disconnect = async () => {
+    setBusy(true);
+    try {
+      await invoke("disconnect_serial");
+      setConnectedPort("");
+      setManifest(null);
+      setTelemetry([]);
+      setErrorText("");
+    } catch (error) {
+      setErrorText(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sendInstruction = async () => {
+    const prompt = draft.trim();
+    if (!prompt || !connectedPort) {
+      return;
+    }
+
+    const plan = planCommands(prompt, manifest);
+
+    setChat((prev) => [...prev, { role: "user", content: prompt }]);
+    setDraft("");
+
+    if (!plan.length) {
+      setChat((prev) => [...prev, { role: "assistant", content: "No matching command found in manifest catalog." }]);
+      return;
+    }
+
+    const planText = plan.map((step) => `RUN ${step.token}${step.args.length ? ` ${step.args.join(" ")}` : ""}`).join(" | ");
+    setChat((prev) => [...prev, { role: "assistant", content: `Plan: ${planText}` }]);
+
+    for (const step of plan) {
+      try {
+        if (step.token === "STOP") {
+          await invoke("send_serial_line", { line: "STOP" });
+        } else {
+          const line = `RUN ${step.token}${step.args.length ? ` ${step.args.join(" ")}` : ""}`;
+          await invoke("send_serial_line", { line });
+        }
+      } catch (error) {
+        setChat((prev) => [...prev, { role: "assistant", content: `Send failed: ${String(error)}` }]);
+      }
     }
   };
 
   return (
-    <main className="app-shell">
-      <div className="bg-overlay" aria-hidden="true" />
+    <div className="app">
+      <header className="topbar">
+        <h1>DAEMON Desktop</h1>
+        <div className="connect-row">
+          <select value={selectedPort} onChange={(event) => setSelectedPort(event.target.value)}>
+            {ports.map((port) => (
+              <option key={port.portName} value={port.portName}>
+                {port.portName} ({port.portType})
+              </option>
+            ))}
+            {!ports.length && <option value="">No serial ports</option>}
+          </select>
+          <button onClick={refreshPorts} disabled={busy}>Refresh</button>
+          {!connectedPort && <button onClick={connect} disabled={busy || !selectedPort}>Connect</button>}
+          {connectedPort && <button onClick={disconnect} disabled={busy}>Disconnect</button>}
+        </div>
+      </header>
 
-      <div className="workspace">
-        <aside className="sidebar">
-          <div className="sidebar-brand">
-            <span className="logo-mark">D</span>
-            <span className="logo-text">Daemon</span>
-          </div>
+      <div className="status-row">
+        <span>{connectedPort ? `Connected: ${connectedPort}` : "Disconnected"}</span>
+        {errorText && <span className="error">{errorText}</span>}
+      </div>
 
-          <label className="search-box">
-            <span className="search-icon">⌕</span>
-            <input
-              value={chatSearch}
-              onChange={(event) => setChatSearch(event.currentTarget.value)}
-              placeholder="Search chats"
-            />
-          </label>
-
-          <button
-            type="button"
-            className="new-chat-btn"
-            onClick={startNewChat}
-            disabled={isStreaming}
-          >
-            New Chat
-          </button>
-
-          <p className="section-label">Recent Chats</p>
-          <div className="history-list">
-            {filteredChats.map((chat) => (
-              <div
-                key={chat.id}
-                className={`history-row ${activeChatId === chat.id ? "active" : ""}`}
-              >
-                <button
-                  type="button"
-                  className={`history-item ${activeChatId === chat.id ? "active" : ""}`}
-                  onClick={() => setActiveChatId(chat.id)}
-                >
-                  <span className="history-title">{chat.title}</span>
-                  <span className="history-meta">
-                    {chat.messages.length} msgs · {formatSidebarTime(chat.updatedAt)}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className="delete-chat-btn"
-                  onClick={() => deleteChat(chat.id)}
-                  disabled={isStreaming}
-                  aria-label={`Delete ${chat.title}`}
-                  title="Delete chat"
-                >
-                  ×
-                </button>
+      <main className="grid">
+        <section className="panel chat-panel">
+          <h2>Chat</h2>
+          <div className="chat-log">
+            {chat.map((message, idx) => (
+              <div key={`${message.role}-${idx}`} className={`msg ${message.role}`}>
+                <strong>{message.role === "user" ? "You" : "Agent"}:</strong> {message.content}
               </div>
             ))}
-            {filteredChats.length === 0 ? (
-              <p className="history-empty">No chats found.</p>
-            ) : null}
+            {!chat.length && <div className="empty">Send a natural language command after connecting.</div>}
           </div>
-        </aside>
-
-        <section className="main-panel">
-          {!activeChat ? (
-            <div className="home-stage">
-              <div className="orb" aria-hidden="true" />
-              <h1>
-                "Hey Daemon, do something"
-              </h1>
-
-              <form
-                className={`home-composer ${isStreaming ? "busy" : ""}`}
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  sendPrompt();
-                }}
-              >
-                <input
-                  value={draft}
-                  onChange={(event) => setDraft(event.currentTarget.value)}
-                  placeholder="Message Daemon..."
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={isStreaming}
-                />
-                <button
-                  type="submit"
-                  disabled={isStreaming || !draft.trim()}
-                  className="send-btn"
-                  aria-label="Send message"
-                >
-                  →
-                </button>
-              </form>
-
-              <div className="feature-grid">
-                <article>
-                  <h3>Capability Interface</h3>
-                  <p>Generates a secure, capability-based command interface from firmware.</p>
-                </article>
-                <article>
-                  <h3>Safety by Design</h3>
-                  <p>Applies explicit command bounds, rate limits, watchdogs, and emergency stop.</p>
-                </article>
-                <article>
-                  <h3>Cross-Embodiment</h3>
-                  <p>Lets one agent operate diverse compliant devices without device-specific code.</p>
-                </article>
-              </div>
-            </div>
-          ) : (
-            <div className="chat-stage">
-              <div className="messages" ref={scrollRef}>
-                {activeMessages.map((message) => (
-                  <article
-                    key={message.id}
-                    className={`bubble ${message.role === "user" ? "bubble-user" : "bubble-assistant"}`}
-                  >
-                    {message.role === "assistant" ? (
-                      <Markdown remarkPlugins={[remarkGfm]}>
-                        {message.content || (message.pending ? "Thinking..." : "")}
-                      </Markdown>
-                    ) : (
-                      message.content || (message.pending ? "Thinking..." : "")
-                    )}
-                  </article>
-                ))}
-              </div>
-
-              <form
-                className={`chat-composer ${isStreaming ? "busy" : ""}`}
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  sendPrompt();
-                }}
-              >
-                <input
-                  value={draft}
-                  onChange={(event) => setDraft(event.currentTarget.value)}
-                  placeholder="Message Daemon..."
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={isStreaming}
-                />
-                <button
-                  type="submit"
-                  disabled={isStreaming || !draft.trim()}
-                  aria-label="Send message"
-                >
-                  →
-                </button>
-              </form>
-            </div>
-          )}
-
-          {errorText ? <p className="error-text">{errorText}</p> : null}
+          <div className="composer">
+            <input
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Example: go forward 30 then turn left 90"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  sendInstruction();
+                }
+              }}
+            />
+            <button onClick={sendInstruction} disabled={!connectedPort}>Send</button>
+            <button onClick={() => invoke("send_serial_line", { line: "STOP" })} disabled={!connectedPort}>STOP</button>
+          </div>
         </section>
-      </div>
-    </main>
+
+        <section className="panel manifest-panel">
+          <h2>Manifest</h2>
+          <div className="manifest-list">
+            {catalog.map((cmd) => (
+              <div key={cmd.token} className="cmd-card">
+                <div className="cmd-token">{cmd.token}</div>
+                <div className="cmd-desc">{cmd.desc}</div>
+                <div className="cmd-args">
+                  {(cmd.args || []).length
+                    ? cmd.args.map((arg) => `${arg.name}:${arg.type}`).join(", ")
+                    : "No args"}
+                </div>
+              </div>
+            ))}
+            {!catalog.length && <div className="empty">Manifest not loaded.</div>}
+          </div>
+        </section>
+
+        <section className="panel telemetry-panel">
+          <h2>Telemetry</h2>
+          <div className="telemetry-log">
+            {telemetry.map((line, idx) => (
+              <div key={`${line}-${idx}`}>{line}</div>
+            ))}
+            {!telemetry.length && <div className="empty">No telemetry yet.</div>}
+          </div>
+        </section>
+
+        <section className="panel wire-panel">
+          <h2>Wire Log</h2>
+          <div className="wire-log">
+            {wireLog.map((line, idx) => (
+              <div key={`${line}-${idx}`}>{line}</div>
+            ))}
+            {!wireLog.length && <div className="empty">No serial messages yet.</div>}
+          </div>
+        </section>
+      </main>
+    </div>
   );
 }
 

@@ -1,0 +1,54 @@
+daemon_version: "0.1"
+device:
+  name: base
+  version: "0.1.0"
+  node_id: base-node-1
+commands:
+  - token: FWD
+    description: Move mobile base forward
+    args:
+      - name: speed
+        type: float
+        min: 0.0
+        max: 1.0
+        required: true
+    safety:
+      rate_limit_hz: 20
+      watchdog_ms: 500
+      clamp: true
+    nlp:
+      synonyms: ["forward", "go ahead"]
+      examples: ["move forward", "drive ahead at 0.6"]
+  - token: TURN
+    description: Rotate base by degrees
+    args:
+      - name: degrees
+        type: float
+        min: -180.0
+        max: 180.0
+        required: true
+    safety:
+      rate_limit_hz: 20
+      watchdog_ms: 500
+      clamp: true
+    nlp:
+      synonyms: ["turn", "rotate"]
+      examples: ["turn left 90", "turn right 45"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: pose_x
+      type: float
+      unit: m
+    - name: pose_y
+      type: float
+      unit: m
+    - name: yaw_deg
+      type: float
+      unit: deg
+transport:
+  type: serial-line-v1

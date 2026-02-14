@@ -1,0 +1,51 @@
+daemon_version: '0.1'
+device:
+  name: annotated_firmware
+  version: 0.1.0
+  node_id: annotated-firmware
+commands:
+- token: L
+  description: Turn left
+  args:
+  - name: intensity
+    type: int
+    min: 0.0
+    max: 255.0
+    required: true
+  safety:
+    rate_limit_hz: 20
+    watchdog_ms: 300
+    clamp: true
+  nlp:
+    synonyms:
+    - l
+    - turn left
+    examples:
+    - Turn left
+- token: FWD
+  description: Move forward
+  args:
+  - name: speed
+    type: int
+    min: 0.0
+    max: 100.0
+    required: true
+  safety:
+    rate_limit_hz: 10
+    watchdog_ms: 500
+    clamp: true
+  nlp:
+    synonyms:
+    - fwd
+    - move forward
+    examples:
+    - Move forward
+telemetry:
+  keys:
+  - name: uptime_ms
+    type: int
+    unit: ms
+  - name: last_token
+    type: string
+transport:
+  type: serial-line-v1

@@ -1,1 +1,1 @@
-"""Daemon CLI package."""
+"""DAEMON CLI package."""

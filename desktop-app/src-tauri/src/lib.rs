@@ -1,182 +1,191 @@
-use dotenvy::from_path;
-use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::path::PathBuf;
-use tauri::Emitter;
+use serde::Serialize;
+use serialport::SerialPort;
+use std::io::{Read, Write};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 
-const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
+const SERIAL_EVENT: &str = "serial_line";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone)]
+struct SerialSession {
+    writer: Arc<Mutex<Box<dyn SerialPort + Send>>>,
+    stop_tx: mpsc::Sender<()>,
+    port_name: String,
+}
+
+#[derive(Default)]
+struct AppState {
+    session: Mutex<Option<SerialSession>>,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StreamChatRequest {
-    request_id: String,
-    messages: Vec<ChatMessage>,
-    model: Option<String>,
+struct SerialPortEntry {
+    port_name: String,
+    port_type: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StreamEvent {
-    request_id: String,
-    kind: String,
-    delta: Option<String>,
-    error: Option<String>,
+struct ConnectionStatus {
+    connected: bool,
+    port_name: Option<String>,
 }
 
-fn load_api_key() -> Result<String, String> {
-    let current_dir = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut env_path = PathBuf::from(&current_dir);
-
-    if current_dir.ends_with("src-tauri") {
-        env_path.pop();
-    }
-
-    env_path.pop();
-    env_path.push(".env");
-
-    if env_path.exists() {
-        let _ = from_path(&env_path);
-    }
-
-    std::env::var("OPEN_AI_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map_err(|_| {
-            format!(
-                "Missing OPEN_AI_API_KEY in {}",
-                env_path.to_string_lossy()
-            )
-        })
-}
-
-fn parse_delta(data: &str) -> Option<String> {
-    let json: Value = serde_json::from_str(data).ok()?;
-    let content = json
-        .get("choices")?
-        .as_array()?
-        .first()?
-        .get("delta")?
-        .get("content")?;
-
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-
-    if let Some(chunks) = content.as_array() {
-        let joined = chunks
-            .iter()
-            .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("");
-
-        if !joined.is_empty() {
-            return Some(joined);
+fn port_type_name(port_type: &serialport::SerialPortType) -> String {
+    match port_type {
+        serialport::SerialPortType::UsbPort(info) => {
+            let mut label = String::from("usb");
+            if let Some(product) = &info.product {
+                label = format!("usb:{product}");
+            }
+            label
         }
+        serialport::SerialPortType::BluetoothPort => String::from("bluetooth"),
+        serialport::SerialPortType::PciPort => String::from("pci"),
+        serialport::SerialPortType::Unknown => String::from("unknown"),
     }
+}
 
-    None
+fn emit_serial_line(app: &AppHandle, line: String) {
+    let _ = app.emit(SERIAL_EVENT, line);
+}
+
+fn stop_session_locked(slot: &mut Option<SerialSession>) {
+    if let Some(session) = slot.take() {
+        let _ = session.stop_tx.send(());
+    }
 }
 
 #[tauri::command]
-async fn stream_chat(app: tauri::AppHandle, request: StreamChatRequest) -> Result<(), String> {
-    if request.messages.is_empty() {
-        return Err("At least one message is required".to_string());
-    }
+fn list_serial_ports() -> Result<Vec<SerialPortEntry>, String> {
+    let ports = serialport::available_ports().map_err(|error| error.to_string())?;
+    let result = ports
+        .into_iter()
+        .map(|port| SerialPortEntry {
+            port_name: port.port_name,
+            port_type: port_type_name(&port.port_type),
+        })
+        .collect::<Vec<_>>();
+    Ok(result)
+}
 
-    let api_key = load_api_key()?;
-    let event_channel = "chat_stream_event";
-    let request_id = request.request_id.clone();
-    let model = request
-        .model
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+#[tauri::command]
+fn connect_serial(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    port_name: String,
+    baud_rate: Option<u32>,
+) -> Result<ConnectionStatus, String> {
+    let baud = baud_rate.unwrap_or(115_200);
 
-    let body = serde_json::json!({
-      "model": model,
-      "stream": true,
-      "messages": request.messages
-    });
+    let port = serialport::new(&port_name, baud)
+        .timeout(Duration::from_millis(120))
+        .open()
+        .map_err(|error| format!("Failed to open serial port {port_name}: {error}"))?;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(OPENAI_URL)
-        .bearer_auth(api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut reader = port
+        .try_clone()
+        .map_err(|error| format!("Failed to clone serial reader: {error}"))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown OpenAI error".to_string());
-        return Err(format!("OpenAI request failed ({status}): {error_body}"));
-    }
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let writer: Arc<Mutex<Box<dyn SerialPort + Send>>> =
+        Arc::new(Mutex::new(port as Box<dyn SerialPort + Send>));
 
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        let mut read_buf = [0_u8; 512];
+        let mut pending = String::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|error| error.to_string())?;
-        let text = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&text);
-
-        while let Some(boundary_index) = buffer.find('\n') {
-            let mut line = buffer[..boundary_index].trim().to_string();
-            buffer.drain(..=boundary_index);
-
-            if line.is_empty() {
-                continue;
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
             }
 
-            if let Some(stripped) = line.strip_prefix("data:") {
-                line = stripped.trim().to_string();
-            }
-
-            if line == "[DONE]" {
-                let _ = app.emit(
-                    event_channel,
-                    StreamEvent {
-                        request_id: request_id.clone(),
-                        kind: "done".to_string(),
-                        delta: None,
-                        error: None,
-                    },
-                );
-                return Ok(());
-            }
-
-            if let Some(delta) = parse_delta(&line) {
-                let _ = app.emit(
-                    event_channel,
-                    StreamEvent {
-                        request_id: request_id.clone(),
-                        kind: "delta".to_string(),
-                        delta: Some(delta),
-                        error: None,
-                    },
-                );
+            match reader.read(&mut read_buf) {
+                Ok(size) if size > 0 => {
+                    pending.push_str(&String::from_utf8_lossy(&read_buf[..size]));
+                    while let Some(index) = pending.find('\n') {
+                        let raw = pending[..index].trim().to_string();
+                        pending.drain(..=index);
+                        if !raw.is_empty() {
+                            emit_serial_line(&app_handle, raw);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(error) => {
+                    emit_serial_line(&app_handle, format!("ERR SERIAL_READ {error}"));
+                    break;
+                }
             }
         }
+    });
+
+    {
+        let mut lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+        stop_session_locked(&mut lock);
+        *lock = Some(SerialSession {
+            writer,
+            stop_tx,
+            port_name: port_name.clone(),
+        });
     }
 
-    let _ = app.emit(
-        event_channel,
-        StreamEvent {
-            request_id,
-            kind: "done".to_string(),
-            delta: None,
-            error: None,
-        },
-    );
+    Ok(ConnectionStatus {
+        connected: true,
+        port_name: Some(port_name),
+    })
+}
+
+#[tauri::command]
+fn disconnect_serial(state: State<'_, AppState>) -> Result<ConnectionStatus, String> {
+    let mut lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    stop_session_locked(&mut lock);
+
+    Ok(ConnectionStatus {
+        connected: false,
+        port_name: None,
+    })
+}
+
+#[tauri::command]
+fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionStatus, String> {
+    let lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    if let Some(session) = &*lock {
+        Ok(ConnectionStatus {
+            connected: true,
+            port_name: Some(session.port_name.clone()),
+        })
+    } else {
+        Ok(ConnectionStatus {
+            connected: false,
+            port_name: None,
+        })
+    }
+}
+
+#[tauri::command]
+fn send_serial_line(state: State<'_, AppState>, line: String) -> Result<(), String> {
+    let lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    let Some(session) = &*lock else {
+        return Err("No active serial connection".to_string());
+    };
+
+    let mut writer = session
+        .writer
+        .lock()
+        .map_err(|_| "Serial writer lock poisoned".to_string())?;
+
+    writer
+        .write_all(format!("{}\n", line.trim()).as_bytes())
+        .map_err(|error| format!("Serial write failed: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Serial flush failed: {error}"))?;
 
     Ok(())
 }
@@ -184,8 +193,15 @@ async fn stream_chat(app: tauri::AppHandle, request: StreamChatRequest) -> Resul
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![stream_chat])
+        .invoke_handler(tauri::generate_handler![
+            list_serial_ports,
+            connect_serial,
+            disconnect_serial,
+            get_connection_status,
+            send_serial_line
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

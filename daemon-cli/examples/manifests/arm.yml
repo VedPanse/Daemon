@@ -1,0 +1,72 @@
+daemon_version: "0.1"
+device:
+  name: arm
+  version: "0.1.0"
+  node_id: arm-node-1
+commands:
+  - token: ARM_TO
+    description: Move arm tool center point
+    args:
+      - name: x
+        type: float
+        min: -1.0
+        max: 1.0
+        required: true
+      - name: y
+        type: float
+        min: -1.0
+        max: 1.0
+        required: true
+      - name: z
+        type: float
+        min: -1.0
+        max: 1.0
+        required: true
+    safety:
+      rate_limit_hz: 10
+      watchdog_ms: 700
+      clamp: true
+    nlp:
+      synonyms: ["arm to", "move arm"]
+      examples: ["move arm to 0.2 0.1 0.4"]
+  - token: GRIP
+    description: Open or close gripper
+    args:
+      - name: state
+        type: string
+        enum: ["open", "close"]
+        required: true
+    safety:
+      rate_limit_hz: 10
+      watchdog_ms: 700
+      clamp: true
+    nlp:
+      synonyms: ["grip", "gripper"]
+      examples: ["open gripper", "close gripper"]
+  - token: HOME
+    description: Move arm to home pose
+    args: []
+    safety:
+      rate_limit_hz: 5
+      watchdog_ms: 1000
+      clamp: true
+    nlp:
+      synonyms: ["home", "reset arm"]
+      examples: ["home arm"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: grip_state
+      type: string
+    - name: joint0
+      type: float
+      unit: deg
+    - name: joint1
+      type: float
+      unit: deg
+transport:
+  type: serial-line-v1

@@ -1,49 +1,51 @@
-# Daemon
+# DAEMON Monorepo
 
-Root-level setup scripts for installing Rust + Tauri CLI are included for both macOS and Windows.
+DAEMON is an AI-native firmware-to-agent bridge with two components:
 
-## Project layout
+- `daemon-cli/`: `./daemon build` generator for firmware repos
+- `desktop-app/`: desktop orchestrator/chat app for DAEMON devices over USB serial
 
-- `desktop-app/`: Tauri + React desktop app
-- `web/`: Vercel Next.js app (ingest API + deployment dashboard)
-- `daemon-cli/`: Firmware generation CLI (`daemon build`, `daemon publish`, `daemon init-samples`)
-- `setup-macos.sh`: macOS installer/bootstrap script
-- `setup-windows.ps1`: Windows installer/bootstrap script
-- `.build/installed-tools.log`: install history written by setup scripts
+## Monorepo layout
+- All CLI build/generation logic is under `daemon-cli/`.
+- All desktop app logic is under `desktop-app/`.
 
-## Quick start
+## How to run
 
-### macOS
-
+### 1) Run `./daemon build` on the example firmware
 ```bash
-chmod +x setup-macos.sh
-./setup-macos.sh
+cd daemon-cli/examples/annotated_firmware
+../../daemon build
 ```
+Generated files will appear in:
+- `daemon-cli/examples/annotated_firmware/generated/DAEMON.yml`
+- `daemon-cli/examples/annotated_firmware/generated/daemon_entry.c`
+- `daemon-cli/examples/annotated_firmware/generated/daemon_runtime.c`
+- `daemon-cli/examples/annotated_firmware/generated/daemon_runtime.h`
+- `daemon-cli/examples/annotated_firmware/generated/DAEMON_INTEGRATION.md`
+- `daemon-cli/examples/annotated_firmware/generated/daemon_manifest.json`
 
-### Windows (PowerShell)
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\setup-windows.ps1
-```
-
-## What the setup scripts install
-
-- Rust toolchain (via `rustup`, stable channel)
-- Tauri CLI (via `cargo install tauri-cli --locked`)
-
-Both scripts append installed/verified versions to `.build/installed-tools.log`.
-
-## Run the desktop app after setup
-
+### 2) Run desktop app and connect
 ```bash
 cd desktop-app
 npm install
 npm run tauri dev
 ```
+In the app:
+1. Click `Refresh` to list serial ports.
+2. Select a device and click `Connect`.
+3. The app sends `HELLO` and `READ_MANIFEST` automatically.
+4. Use chat to send natural language goals and watch telemetry/log panels.
 
-## Notes
-
-- macOS script attempts to install Xcode Command Line Tools if missing.
-- Windows script uses `winget` for Rust bootstrap when `rustup` is missing.
-- See `daemon-cli/readme.txt` for the firmware config generation + API publish workflow.
+## Verification
+- CLI tests:
+```bash
+cd daemon-cli
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+```
+- Desktop checks:
+```bash
+cd desktop-app
+npm run build
+cd src-tauri
+cargo check
+```
