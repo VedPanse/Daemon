@@ -48,6 +48,11 @@ desktop-app/.pnpm-store/
 desktop-app/.yarn/
 desktop-app/.cache/
 desktop-app/.vite/
+vercel-api/node_modules/
+vercel-api/.next/
+vercel-api/.npm/
+vercel-api/.pnpm-store/
+vercel-api/.yarn/
 
 # Tauri / Rust
 desktop-app/src-tauri/target/

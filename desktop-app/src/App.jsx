@@ -6,13 +6,12 @@ const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
 const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
 const FRAME_WIDTH = 320;
 const FRAME_HEIGHT = 240;
-const CAPTURE_INTERVAL_MS = 300;
+const DEFAULT_CAPTURE_INTERVAL_MS = 300;
 const STATUS_POLL_MS = 2000;
-const INSTRUCTION = "pick the blue cube";
+const RUNTIME_IS_TAURI = isTauri();
 
 const VERCEL_BASE_URL = import.meta.env.VITE_VERCEL_BASE_URL || DEFAULT_VERCEL_BASE_URL;
 const ORCH_BASE_URL = import.meta.env.VITE_ORCHESTRATOR_BASE_URL || DEFAULT_ORCH_BASE_URL;
-const RUNTIME_IS_TAURI = isTauri();
 
 const INITIAL_STATE = {
   stage: "SEARCH",
@@ -26,6 +25,8 @@ const INITIAL_STATE = {
     arm_grip_token: "GRIP"
   }
 };
+
+const DEFAULT_PROMPT = "pick up the banana";
 
 function nowStamp() {
   return new Date().toLocaleTimeString();
@@ -61,6 +62,7 @@ async function captureFrameBase64(video, canvas) {
   if (!blob) {
     return null;
   }
+
   return blobToBase64(blob);
 }
 
@@ -70,10 +72,12 @@ async function postVisionJson(url, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
+
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     throw new Error(data?.error || data?.message || `HTTP ${resp.status}`);
   }
+
   return data;
 }
 
@@ -91,25 +95,27 @@ function drawOverlay(canvas, perception) {
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  if (!perception?.found || !perception?.bbox) {
+  const target = perception?.selected_target || (perception?.found ? { bbox: perception?.bbox, confidence: perception?.confidence } : null);
+  if (!target?.bbox) {
     return;
   }
+  const { x, y, w: bw, h: bh } = target.bbox;
+  const normalized = bw <= 1 && bh <= 1;
+  const sx = normalized ? w : w / FRAME_WIDTH;
+  const sy = normalized ? h : h / FRAME_HEIGHT;
 
-  const sx = w / FRAME_WIDTH;
-  const sy = h / FRAME_HEIGHT;
-  const { x, y, w: bw, h: bh } = perception.bbox;
-
-  ctx.strokeStyle = "#1f7cff";
-  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#4f8ff8";
+  ctx.lineWidth = 2;
   ctx.strokeRect(x * sx, y * sy, bw * sx, bh * sy);
 
-  const label = `blue ${Number(perception.confidence || 0).toFixed(2)}`;
-  ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, monospace";
+  const labelText = target?.label ? String(target.label) : "target";
+  const label = `${labelText} ${Number(target?.confidence || 0).toFixed(2)}`;
+  ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, monospace";
   const tw = ctx.measureText(label).width;
-  ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
-  ctx.fillRect(x * sx, Math.max(0, y * sy - 22), tw + 14, 20);
+  ctx.fillStyle = "rgba(13, 18, 24, 0.74)";
+  ctx.fillRect(x * sx, Math.max(0, y * sy - 20), tw + 12, 18);
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(label, x * sx + 7, Math.max(14, y * sy - 8));
+  ctx.fillText(label, x * sx + 6, Math.max(12, y * sy - 7));
 }
 
 async function orchestratorStatus(orchestratorBaseUrl) {
@@ -117,12 +123,10 @@ async function orchestratorStatus(orchestratorBaseUrl) {
     try {
       return await invoke("orchestrator_status", { orchestratorBaseUrl });
     } catch (error) {
-      throw new Error(
-        `Tauri proxy GET ${orchestratorBaseUrl}/status failed: ${String(error)}. ` +
-        "If you are viewing localhost:1420 in a browser tab, use the Tauri app window instead."
-      );
+      throw new Error(`Tauri proxy GET ${orchestratorBaseUrl}/status failed: ${String(error)}`);
     }
   }
+
   const resp = await fetch(`${orchestratorBaseUrl}/status`);
   if (!resp.ok) {
     throw new Error(`GET ${orchestratorBaseUrl}/status failed: HTTP ${resp.status}`);
@@ -135,12 +139,10 @@ async function orchestratorExecutePlan(orchestratorBaseUrl, plan) {
     try {
       return await invoke("orchestrator_execute_plan", { orchestratorBaseUrl, plan });
     } catch (error) {
-      throw new Error(
-        `Tauri proxy POST ${orchestratorBaseUrl}/execute_plan failed: ${String(error)}. ` +
-        "If you are viewing localhost:1420 in a browser tab, use the Tauri app window instead."
-      );
+      throw new Error(`Tauri proxy POST ${orchestratorBaseUrl}/execute_plan failed: ${String(error)}`);
     }
   }
+
   const resp = await fetch(`${orchestratorBaseUrl}/execute_plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -158,12 +160,10 @@ async function orchestratorStop(orchestratorBaseUrl) {
     try {
       return await invoke("orchestrator_stop", { orchestratorBaseUrl });
     } catch (error) {
-      throw new Error(
-        `Tauri proxy POST ${orchestratorBaseUrl}/stop failed: ${String(error)}. ` +
-        "If you are viewing localhost:1420 in a browser tab, use the Tauri app window instead."
-      );
+      throw new Error(`Tauri proxy POST ${orchestratorBaseUrl}/stop failed: ${String(error)}`);
     }
   }
+
   const resp = await fetch(`${orchestratorBaseUrl}/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -185,26 +185,38 @@ function App() {
   const inFlightRef = useRef(false);
   const stateRef = useRef(INITIAL_STATE);
 
+  const [taskPrompt, setTaskPrompt] = useState(DEFAULT_PROMPT);
+  const [captureIntervalMs] = useState(DEFAULT_CAPTURE_INTERVAL_MS);
   const [liveEnabled, setLiveEnabled] = useState(false);
   const [sendingFrames, setSendingFrames] = useState(false);
+  const [dryRun, setDryRun] = useState(false);
+
   const [fsmState, setFsmState] = useState(INITIAL_STATE);
   const [perception, setPerception] = useState(null);
   const [lastPlan, setLastPlan] = useState([]);
   const [lastDebug, setLastDebug] = useState(null);
 
-  const [dryRun, setDryRun] = useState(false);
   const [orchestratorReachable, setOrchestratorReachable] = useState(false);
   const [lastOrchestratorError, setLastOrchestratorError] = useState("");
-  const [lastActionText, setLastActionText] = useState("");
+  const [lastActionText, setLastActionText] = useState("idle");
   const [lastActionTimestamp, setLastActionTimestamp] = useState("");
   const [errorText, setErrorText] = useState("");
+
+  const promptReady = taskPrompt.trim().length > 0;
 
   const statusText = useMemo(() => {
     if (!liveEnabled) {
       return sendingFrames ? "single-step in progress" : "idle";
     }
-    return sendingFrames ? "live / sending frames" : "live / waiting";
+    return sendingFrames ? "live loop active" : "live loop waiting";
   }, [liveEnabled, sendingFrames]);
+
+  const capabilityNote = useMemo(() => {
+    if (!taskPrompt.trim()) {
+      return "Enter a task prompt to start.";
+    }
+    return "Live instruction is sent on every frame. Edit mid-run to change behavior on the next frame.";
+  }, [taskPrompt]);
 
   useEffect(() => {
     drawOverlay(overlayCanvasRef.current, perception);
@@ -216,17 +228,15 @@ function App() {
     const poll = async () => {
       try {
         await orchestratorStatus(ORCH_BASE_URL);
-        if (cancelled) {
-          return;
+        if (!cancelled) {
+          setOrchestratorReachable(true);
+          setLastOrchestratorError("");
         }
-        setOrchestratorReachable(true);
-        setLastOrchestratorError("");
       } catch (error) {
-        if (cancelled) {
-          return;
+        if (!cancelled) {
+          setOrchestratorReachable(false);
+          setLastOrchestratorError(String(error));
         }
-        setOrchestratorReachable(false);
-        setLastOrchestratorError(String(error));
       }
     };
 
@@ -246,12 +256,13 @@ function App() {
   };
 
   const releaseCamera = () => {
-    if (streamRef.current) {
-      for (const track of streamRef.current.getTracks()) {
-        track.stop();
-      }
-      streamRef.current = null;
+    if (!streamRef.current) {
+      return;
     }
+    for (const track of streamRef.current.getTracks()) {
+      track.stop();
+    }
+    streamRef.current = null;
   };
 
   const ensureCamera = async () => {
@@ -286,21 +297,23 @@ function App() {
     setLiveEnabled(false);
     releaseCamera();
 
-    if (sendStop) {
-      try {
-        await orchestratorStop(ORCH_BASE_URL);
-        setOrchestratorReachable(true);
-        setLastOrchestratorError("");
-        setLastActionText("STOP OK");
-        setLastActionTimestamp(nowStamp());
-      } catch (error) {
-        const msg = String(error);
-        setOrchestratorReachable(false);
-        setLastOrchestratorError(msg);
-        setLastActionText("STOP FAILED");
-        setLastActionTimestamp(nowStamp());
-        setErrorText(`STOP failed: ${msg}`);
-      }
+    if (!sendStop) {
+      return;
+    }
+
+    try {
+      await orchestratorStop(ORCH_BASE_URL);
+      setOrchestratorReachable(true);
+      setLastOrchestratorError("");
+      setLastActionText("STOP OK");
+      setLastActionTimestamp(nowStamp());
+    } catch (error) {
+      const msg = String(error);
+      setOrchestratorReachable(false);
+      setLastOrchestratorError(msg);
+      setLastActionText("STOP FAILED");
+      setLastActionTimestamp(nowStamp());
+      setErrorText(`STOP failed: ${msg}`);
     }
   };
 
@@ -312,6 +325,11 @@ function App() {
 
   const executeSingleVisionStep = async ({ executePlan }) => {
     if (inFlightRef.current) {
+      return;
+    }
+
+    if (!promptReady) {
+      setErrorText("Task prompt is required.");
       return;
     }
 
@@ -327,7 +345,7 @@ function App() {
 
       const visionPayload = {
         frame_jpeg_base64,
-        instruction: INSTRUCTION,
+        instruction: taskPrompt.trim(),
         state: stateRef.current,
         system_manifest: null,
         telemetry_snapshot: null
@@ -346,16 +364,16 @@ function App() {
 
       if (executePlan) {
         const response = await orchestratorExecutePlan(ORCH_BASE_URL, nextPlan);
-        const ok = Boolean(response?.ok);
-        if (!ok) {
+        if (!response?.ok) {
           throw new Error(response?.error || "execute_plan returned non-ok response");
         }
         setOrchestratorReachable(true);
         setLastOrchestratorError("");
         setLastActionText("EXECUTE_PLAN OK");
       } else {
-        setLastActionText("DRY RUN: plan not executed");
+        setLastActionText("DRY RUN: plan generated only");
       }
+
       setLastActionTimestamp(nowStamp());
 
       if (String(nextState?.stage || "").toUpperCase() === "DONE" && liveEnabled) {
@@ -368,6 +386,7 @@ function App() {
       setLastOrchestratorError(msg);
       setLastActionText("STEP FAILED");
       setLastActionTimestamp(nowStamp());
+
       if (liveEnabled) {
         await stopLoop({ sendStop: true });
       }
@@ -390,7 +409,7 @@ function App() {
 
       liveTimerRef.current = setInterval(() => {
         executeSingleVisionStep({ executePlan: !dryRun });
-      }, CAPTURE_INTERVAL_MS);
+      }, captureIntervalMs);
     } catch (error) {
       setErrorText(`Camera start failed: ${String(error)}`);
       await stopLoop({ sendStop: false });
@@ -414,58 +433,70 @@ function App() {
   };
 
   return (
-    <div className="live-app">
-      <header className="header">
-        <h1>DAEMON Live Camera</h1>
-        <div className="button-row">
-          <button onClick={handleLiveToggle} className={liveEnabled ? "btn-live active" : "btn-live"}>
-            {liveEnabled ? "Disable Live Camera" : "Enable Live Camera"}
-          </button>
-          <button onClick={handleSingleStep} className="btn-step">SINGLE STEP</button>
-          <button onClick={handleStop} className="btn-stop">STOP</button>
+    <div className="studio">
+      <div className="hero">
+        <div>
+          <p className="eyebrow">DAEMON Control Studio</p>
+          <h1>Natural-Language Robot Control</h1>
+          <p className="sub">Write the task in plain language. The app loops camera perception + plan execution in real time.</p>
         </div>
-      </header>
+        <div className={orchestratorReachable ? "health ok" : "health bad"}>
+          <span className="dot" />
+          <span>{orchestratorReachable ? "Orchestrator Online" : "Orchestrator Offline"}</span>
+        </div>
+      </div>
 
-      <section className="status-bar">
-        <span><strong>Status:</strong> {statusText}</span>
-        <span><strong>Runtime:</strong> {RUNTIME_IS_TAURI ? "Tauri" : "Browser (fallback mode)"}</span>
-        <span><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</span>
-        <span><strong>Vision API:</strong> {VERCEL_BASE_URL}</span>
-        <span><strong>Orchestrator:</strong> {ORCH_BASE_URL}</span>
-        <span><strong>Orchestrator reachable:</strong> {String(orchestratorReachable)}</span>
-        <span><strong>Last action:</strong> {lastActionText || "-"}</span>
-        <span><strong>Last action at:</strong> {lastActionTimestamp || "-"}</span>
-        <span><strong>DRY RUN:</strong> {String(dryRun)}</span>
+      <section className="prompt-card">
+        <label htmlFor="taskPrompt">Task Prompt</label>
+        <div className="prompt-row">
+          <input
+            id="taskPrompt"
+            value={taskPrompt}
+            onChange={(event) => setTaskPrompt(event.target.value)}
+            placeholder="pick up the banana"
+          />
+          <button className="ghost" onClick={() => setTaskPrompt(DEFAULT_PROMPT)}>Reset</button>
+        </div>
+        <p className="note">{capabilityNote}</p>
       </section>
 
-      <section className="toggle-row">
-        <label>
+      <section className="controls">
+        <button className={liveEnabled ? "primary active" : "primary"} onClick={handleLiveToggle} disabled={!promptReady}>
+          {liveEnabled ? "Stop Live Loop" : "Enable Live Camera"}
+        </button>
+        <button className="secondary" onClick={handleSingleStep} disabled={!promptReady}>Single Step</button>
+        <button className="panic" onClick={handleStop}>STOP</button>
+        <label className="toggle">
           <input type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
-          DRY RUN (do not call execute_plan)
+          <span>Dry Run</span>
         </label>
       </section>
 
-      {lastOrchestratorError ? (
-        <section className="error-box">
-          <strong>Last orchestrator error:</strong> {lastOrchestratorError}
-        </section>
-      ) : null}
+      <section className="meta-grid">
+        <div><strong>Runtime:</strong> {RUNTIME_IS_TAURI ? "Tauri" : "Browser fallback"}</div>
+        <div><strong>Status:</strong> {statusText}</div>
+        <div><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</div>
+        <div><strong>Last action:</strong> {lastActionText || "-"}</div>
+        <div><strong>At:</strong> {lastActionTimestamp || "-"}</div>
+        <div><strong>Vision API:</strong> {VERCEL_BASE_URL}</div>
+      </section>
 
-      {errorText ? <section className="error-box">{errorText}</section> : null}
+      {lastOrchestratorError ? <section className="error">Last orchestrator error: {lastOrchestratorError}</section> : null}
+      {errorText ? <section className="error">{errorText}</section> : null}
 
-      <main className="layout">
+      <main className="grid">
         <section className="panel video-panel">
-          <h2>Live Preview</h2>
+          <h2>Live Camera</h2>
           <div className="video-shell">
             <video ref={videoRef} autoPlay muted playsInline className="video" />
             <canvas ref={overlayCanvasRef} className="overlay" />
           </div>
           <canvas ref={captureCanvasRef} className="hidden-canvas" />
-          <div className="perception-meta">
-            <div>found: {String(Boolean(perception?.found))}</div>
-            <div>confidence: {Number(perception?.confidence || 0).toFixed(3)}</div>
-            <div>offset_x: {Number(perception?.center_offset_x || 0).toFixed(1)}</div>
-            <div>area: {Number(perception?.area || 0).toFixed(1)}</div>
+          <div className="metrics">
+            <span>found: {String(Boolean(perception?.found))}</span>
+            <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
+            <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
+            <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
           </div>
         </section>
 

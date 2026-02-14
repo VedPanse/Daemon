@@ -2,7 +2,7 @@
 
 This project is the deploy target for DAEMON cloud endpoints. It includes:
 - `POST /api/plan` and `POST /plan` for orchestrator planning
-- `POST /api/vision_step` for deterministic blue-cube servo control
+- `POST /api/vision_step` for deterministic instruction-driven servo control
 - `POST /api/v1/daemon-configs/ingest` for CLI publish ingest
 - `GET /api/health` for service health checks
 
@@ -25,6 +25,10 @@ All are optional for MVP:
 - `BLOB_READ_WRITE_TOKEN`
   - If set, ingest artifacts are persisted to Vercel Blob
   - If missing, ingest still returns success without persistence
+- `OPENAI_API_KEY`
+  - If set, `/api/vision_step` uses OpenAI vision for open-vocabulary object detection
+- `OPENAI_VISION_MODEL`
+  - Optional model override for vision perception (default `gpt-4.1-mini`)
 
 ## Planner endpoint
 
@@ -41,9 +45,12 @@ All are optional for MVP:
   - optional `system_manifest`, `telemetry_snapshot`
 - Output:
   - updated `state`
-  - `perception` (`found`, `bbox`, `area`, `center_offset_x`, `confidence`)
+  - `perception` (`objects[]`, `selected_target`, `summary`, plus compatibility fields `found`, `bbox`, `area`, `offset_x`, `center_offset_x`, `confidence`)
   - short `plan` for `base`/`arm` (`RUN` + `STOP`)
   - `debug`
+- Task parsing:
+  - Deterministic instruction router (`stop`, `move-pattern`, `pick-object`, `follow`, `search`, `avoid+approach`)
+  - Instruction hash reset (`state.instruction_ctx.hash`) for immediate behavior changes
 
 ## Example request
 
