@@ -5,7 +5,7 @@ Root-level setup scripts for installing Rust + Tauri CLI are included for both m
 ## Project layout
 
 - `desktop-app/`: Tauri + React desktop app
-- `daemon-cli/`: CLI area (currently minimal)
+- `daemon-cli/`: Firmware generation CLI (`daemon build`, `daemon publish`, `daemon init-samples`)
 - `setup-macos.sh`: macOS installer/bootstrap script
 - `setup-windows.ps1`: Windows installer/bootstrap script
 - `.build/installed-tools.log`: install history written by setup scripts
@@ -45,3 +45,4 @@ npm run tauri dev
 
 - macOS script attempts to install Xcode Command Line Tools if missing.
 - Windows script uses `winget` for Rust bootstrap when `rustup` is missing.
+- See `daemon-cli/readme.txt` for the firmware config generation + API publish workflow.

@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "config_id": "rc_car_pi_arduino-20260214t065054z-4804ce",
+  "profile": "rc_car_pi_arduino",
+  "created_at": "2026-02-14T06:50:54.621334Z",
+  "generation_mode": "template",
+  "model": null,
+  "context": {
+    "source_dir": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/profiles/rc_car_pi_arduino",
+    "file_count": 5,
+    "files": [
+      "README.md",
+      "arduino/motor_controller.c",
+      "arduino/motor_controller.h",
+      "protocol/serial_protocol.md",
+      "raspberry_pi/vision_bridge.py"
+    ],
+    "sha256": "b0a2e4a5f9c5836811ad0711850c477a29646cc4bc32bec7887c6626503a9c46"
+  },
+  "artifacts": {
+    "config_dir": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/rc_car_pi_arduino-20260214t065054z-4804ce",
+    "daemon_yaml_path": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/rc_car_pi_arduino-20260214t065054z-4804ce/DAEMON.yaml",
+    "daemon_entry_path": "/Users/sachin/Documents/TreeHacks/Daemon/firmware-code/configs/rc_car_pi_arduino-20260214t065054z-4804ce/daemon_entry.c"
+  },
+  "api_target": {
+    "collection": "daemon-configs",
+    "subfolder": "rc_car_pi_arduino-20260214t065054z-4804ce"
+  },
+  "publish": {
+    "status": "error",
+    "http_status": null,
+    "url": "http://127.0.0.1:9/api/daemon-configs",
+    "error": "URLError: [Errno 1] Operation not permitted"
+  }
+}

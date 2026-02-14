@@ -1,0 +1,8 @@
+commands:
+  - id: climate.set_target_humidity
+    args: [percent]
+  - id: irrigation.manual_override
+    args: [enabled, duration_s]
+events:
+  - id: telemetry.climate
+  - id: alert.sensor_fault
