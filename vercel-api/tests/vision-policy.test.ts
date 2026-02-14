@@ -48,6 +48,13 @@ run("parseInstruction person pick phrase", () => {
   assert.equal(parsed.target.label, "person");
 });
 
+run("parseInstruction keeps generic qualifier token", () => {
+  const parsed = parseInstruction("pick up the cyan box");
+  assert.equal(parsed.task_type, "pick-object");
+  assert.equal(parsed.target.label, "box");
+  assert.equal(parsed.target.color, "cyan");
+});
+
 run("canonicalLabel phone aliases", () => {
   assert.equal(canonicalLabel("SmartPhone"), "phone");
   assert.equal(canonicalLabel("cell phone"), "phone");

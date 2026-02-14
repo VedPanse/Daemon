@@ -5,7 +5,7 @@ export type MotionPattern = "circle" | "square" | "triangle" | "forward";
 export interface TargetSpec {
   query: string | null;
   label: string | null;
-  color: "red" | "blue" | "green" | "yellow" | null;
+  color: string | null;
 }
 
 export interface ParsedInstruction {
@@ -134,17 +134,19 @@ function extractTargetQuery(text: string): string | null {
 
 function extractColor(query: string | null): TargetSpec["color"] {
   if (!query) return null;
-  if (query.includes("red")) return "red";
-  if (query.includes("blue")) return "blue";
-  if (query.includes("green")) return "green";
-  if (query.includes("yellow")) return "yellow";
-  return null;
+  const tokens = query
+    .split(/\s+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((token) => !["the", "a", "an", "object", "it"].includes(token));
+  if (tokens.length <= 1) return null;
+  return tokens[0];
 }
 
 function extractLabel(query: string | null): string | null {
   if (!query) return null;
 
-  const stopWords = new Set(["the", "a", "an", "red", "blue", "green", "yellow", "object", "it"]);
+  const stopWords = new Set(["the", "a", "an", "object", "it"]);
   const tokens = query
     .split(/\s+/)
     .map((t) => t.trim())

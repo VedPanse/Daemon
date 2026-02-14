@@ -25,6 +25,16 @@ function makeFrameBase64() {
   return jpeg.encode({ data, width, height }, 65).data.toString("base64");
 }
 
+function instructionHash(instruction: string) {
+  const normalized = instruction.toLowerCase().replace(/\s+/g, " ").trim();
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash ^= normalized.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function installOpenAIMock(resolver: (instruction: string) => MockObject[]) {
   const originalFetch = globalThis.fetch;
   process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
@@ -99,6 +109,77 @@ run("prompt switch: parsed target updates on immediate next frame", async () => 
     assert.equal(t.debug?.parsed_instruction?.target?.label, "banana");
     assert.equal(t1.debug?.parsed_instruction?.target?.label, "person");
     assert.equal(t1.debug?.applied_instruction, "walk to a person and pick it up");
+  } finally {
+    restore();
+  }
+});
+
+run("task validation fails when qualifier does not match selected target", async () => {
+  const restore = installOpenAIMock(() => [
+    { label: "box", confidence: 0.95, bbox: { x: 0.45, y: 0.28, w: 0.22, h: 0.22 }, attributes: ["red"] }
+  ]);
+  try {
+    const instruction = "pick up the blue box";
+    const state = {
+      stage: "GRAB",
+      scan_dir: 1,
+      scan_ticks: 0,
+      capabilities: {
+        base_target: "base",
+        arm_target: "arm",
+        base_turn_token: "TURN",
+        base_fwd_token: "FWD",
+        arm_grip_token: "GRIP"
+      },
+      instruction_ctx: { hash: instructionHash(instruction) },
+      motion_ctx: { consumed: false, step_idx: 0, total_steps: 0 },
+      target_lock_ctx: null,
+      verification_ctx: {
+        status: "on_track",
+        confidence: 0.8,
+        on_track_streak: 2,
+        off_track_streak: 0,
+        last_motion_score: 0.02,
+        last_offset_abs: 0.03,
+        last_area: 0.05,
+        last_signature: [0.1, 0.1, 0.1, 0.1, 0.1]
+      },
+      learning_ctx: {
+        confidence_floor: 0.35,
+        align_tolerance: 0.07,
+        frames: 1,
+        on_track_frames: 1,
+        false_switches: 0,
+        recovery_count: 0,
+        avg_latency_ms: 100,
+        last_selected_label: "box"
+      },
+      task_eval_ctx: {
+        episode_index: 0,
+        finalized: false,
+        last_outcome: "pending",
+        success_streak: 0,
+        failure_streak: 0,
+        target_label: "box",
+        target_color: "blue",
+        label_mismatch_count: 0,
+        color_mismatch_count: 0
+      },
+      perf_ctx: {
+        frame_index: 0,
+        last_latency_ms: 100,
+        recommended_interval_ms: 180,
+        last_openai_frame: -1000,
+        cached_perception: null,
+        cached_source: "none"
+      }
+    };
+    const out = await postVision(makeFrameBase64(), instruction, state);
+    assert.equal(out.state?.stage, "DONE");
+    assert.equal(out.debug?.task_validation?.outcome, "failure");
+    assert.equal(out.debug?.task_validation?.checks?.target_label_ok, true);
+    assert.equal(out.debug?.task_validation?.checks?.target_color_ok, false);
+    assert.equal(out.state?.task_eval_ctx?.last_outcome, "failure");
   } finally {
     restore();
   }

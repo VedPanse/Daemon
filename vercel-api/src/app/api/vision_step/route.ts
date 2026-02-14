@@ -39,7 +39,7 @@ type MotionPattern = "circle" | "square" | "triangle" | "forward";
 interface TargetSpec {
   query: string | null;
   label: string | null;
-  color: "red" | "blue" | "green" | "yellow" | null;
+  color: string | null;
 }
 
 interface ParsedInstruction {
@@ -126,6 +126,17 @@ interface VisionState {
     avg_latency_ms: number;
     last_selected_label: string | null;
   };
+  task_eval_ctx: {
+    episode_index: number;
+    finalized: boolean;
+    last_outcome: "pending" | "success" | "failure";
+    success_streak: number;
+    failure_streak: number;
+    target_label: string | null;
+    target_color: string | null;
+    label_mismatch_count: number;
+    color_mismatch_count: number;
+  };
   perf_ctx: {
     frame_index: number;
     last_latency_ms: number;
@@ -157,6 +168,33 @@ interface PerceptionSchedule {
   reason: string;
   openai_period_frames: number;
   strong_lock: boolean;
+}
+
+interface TaskValidation {
+  outcome: "pending" | "success" | "failure";
+  reason: string;
+  checks: {
+    motion_ok: boolean;
+    target_label_ok: boolean;
+    target_color_ok: boolean;
+    grasp_intent_ok: boolean;
+    selected_label: string | null;
+    selected_color: string | null;
+  };
+}
+
+interface PersistentTaskMetrics {
+  total_success: number;
+  total_failure: number;
+  by_target: Record<
+    string,
+    {
+      success: number;
+      failure: number;
+      label_mismatch: number;
+      color_mismatch: number;
+    }
+  >;
 }
 
 const DEFAULT_STATE: VisionState = {
@@ -199,6 +237,17 @@ const DEFAULT_STATE: VisionState = {
     avg_latency_ms: 0,
     last_selected_label: null
   },
+  task_eval_ctx: {
+    episode_index: 0,
+    finalized: false,
+    last_outcome: "pending",
+    success_streak: 0,
+    failure_streak: 0,
+    target_label: null,
+    target_color: null,
+    label_mismatch_count: 0,
+    color_mismatch_count: 0
+  },
   perf_ctx: {
     frame_index: 0,
     last_latency_ms: 0,
@@ -213,6 +262,7 @@ const ALIGN_OFFSET_THRESHOLD = 0.07;
 const SEARCH_STEP_DEG = 12;
 const CLOSE_AREA_THRESHOLD = 0.09;
 const OPENAI_MIN_CONFIDENCE = 0.35;
+const TASK_METRICS_FILE = path.join(process.cwd(), ".daemon", "vision_task_metrics.json");
 let FILE_ENV_CACHE: Record<string, string> | null = null;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -303,6 +353,152 @@ function envValue(...keys: string[]): string | undefined {
   return undefined;
 }
 
+function targetMetricsKey(parsed: ParsedInstruction): string {
+  const label = parsed.target.label ? canonicalLabel(parsed.target.label) : "any";
+  const color = parsed.target.color || "any";
+  return `${parsed.task_type}|${label}|${color}`;
+}
+
+function readPersistentTaskMetrics(): PersistentTaskMetrics {
+  try {
+    if (!fs.existsSync(TASK_METRICS_FILE)) {
+      return { total_success: 0, total_failure: 0, by_target: {} };
+    }
+    const raw = JSON.parse(fs.readFileSync(TASK_METRICS_FILE, "utf8"));
+    if (!raw || typeof raw !== "object") {
+      return { total_success: 0, total_failure: 0, by_target: {} };
+    }
+    return {
+      total_success: typeof raw.total_success === "number" ? Math.max(0, Math.floor(raw.total_success)) : 0,
+      total_failure: typeof raw.total_failure === "number" ? Math.max(0, Math.floor(raw.total_failure)) : 0,
+      by_target: isObject(raw.by_target) ? (raw.by_target as PersistentTaskMetrics["by_target"]) : {}
+    };
+  } catch {
+    return { total_success: 0, total_failure: 0, by_target: {} };
+  }
+}
+
+function writePersistentTaskMetrics(metrics: PersistentTaskMetrics): void {
+  fs.mkdirSync(path.dirname(TASK_METRICS_FILE), { recursive: true });
+  fs.writeFileSync(TASK_METRICS_FILE, JSON.stringify(metrics, null, 2), "utf8");
+}
+
+function persistTaskOutcome(parsed: ParsedInstruction, validation: TaskValidation): PersistentTaskMetrics {
+  const metrics = readPersistentTaskMetrics();
+  const key = targetMetricsKey(parsed);
+  const existing = metrics.by_target[key] || {
+    success: 0,
+    failure: 0,
+    label_mismatch: 0,
+    color_mismatch: 0
+  };
+
+  if (validation.outcome === "success") {
+    metrics.total_success += 1;
+    existing.success += 1;
+  } else if (validation.outcome === "failure") {
+    metrics.total_failure += 1;
+    existing.failure += 1;
+  }
+
+  if (!validation.checks.target_label_ok) {
+    existing.label_mismatch += 1;
+  }
+  if (!validation.checks.target_color_ok) {
+    existing.color_mismatch += 1;
+  }
+
+  metrics.by_target[key] = existing;
+  writePersistentTaskMetrics(metrics);
+  return metrics;
+}
+
+function extractObjectDescriptor(selected: PerceivedObject | undefined, expectedQualifier: string | null): string | null {
+  if (!selected) return null;
+  const values = [selected.label, ...(selected.attributes || [])].map((v) => v.toLowerCase());
+  if (expectedQualifier) {
+    if (values.some((value) => value.includes(expectedQualifier))) {
+      return expectedQualifier;
+    }
+    return null;
+  }
+  if (values.length > 0) return values[0].split(/\s+/)[0] || null;
+  return null;
+}
+
+function evaluateTaskValidation(
+  parsed: ParsedInstruction,
+  state: VisionState,
+  nextState: VisionState,
+  perception: Perception,
+  plan: PlanStep[],
+  motionScore: number,
+  recoveryTriggered: boolean
+): TaskValidation {
+  const selected = perception.selected_target;
+  const selectedLabel = selected ? canonicalLabel(selected.label) : null;
+  const expectedColor = parsed.target.color ? parsed.target.color.toLowerCase() : null;
+  const selectedColor = extractObjectDescriptor(selected, expectedColor);
+  const expectedLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : null;
+
+  const baseMotionCommanded = plan.some(
+    (step) => step.type === "RUN" && step.target === state.capabilities.base_target && (step.token === state.capabilities.base_fwd_token || step.token === state.capabilities.base_turn_token)
+  );
+  const motionDelta =
+    Math.abs(state.verification_ctx.last_offset_abs - Math.abs(perception.offset_x)) + Math.abs(state.verification_ctx.last_area - perception.area);
+  const motionOk = !baseMotionCommanded || motionScore >= 0.005 || motionDelta >= 0.003;
+  const targetLabelOk = !expectedLabel || (selectedLabel !== null && selectedLabel === expectedLabel);
+  const targetColorOk = !expectedColor || selectedColor === expectedColor;
+  const graspIntentOk =
+    nextState.stage !== "DONE" ||
+    state.stage === "GRAB" ||
+    plan.some((step) => step.type === "RUN" && step.target === state.capabilities.arm_target && step.token === state.capabilities.arm_grip_token);
+
+  if (recoveryTriggered) {
+    return {
+      outcome: "failure",
+      reason: "recovery_stop_triggered",
+      checks: {
+        motion_ok: motionOk,
+        target_label_ok: targetLabelOk,
+        target_color_ok: targetColorOk,
+        grasp_intent_ok: false,
+        selected_label: selectedLabel,
+        selected_color: selectedColor
+      }
+    };
+  }
+
+  if (parsed.task_type === "pick-object" && nextState.stage === "DONE") {
+    const success = motionOk && targetLabelOk && targetColorOk && graspIntentOk;
+    return {
+      outcome: success ? "success" : "failure",
+      reason: success ? "pick_verified" : "pick_verification_failed",
+      checks: {
+        motion_ok: motionOk,
+        target_label_ok: targetLabelOk,
+        target_color_ok: targetColorOk,
+        grasp_intent_ok: graspIntentOk,
+        selected_label: selectedLabel,
+        selected_color: selectedColor
+      }
+    };
+  }
+
+  return {
+    outcome: "pending",
+    reason: "task_in_progress",
+    checks: {
+      motion_ok: motionOk,
+      target_label_ok: targetLabelOk,
+      target_color_ok: targetColorOk,
+      grasp_intent_ok: graspIntentOk,
+      selected_label: selectedLabel,
+      selected_color: selectedColor
+    }
+  };
+}
+
 function asCachedPerception(value: unknown): Perception | null {
   if (!isObject(value)) return null;
   if (!Array.isArray(value.objects)) return null;
@@ -331,6 +527,7 @@ function normalizeState(input: unknown): VisionState {
   const lockInput = isObject(input.target_lock_ctx) ? input.target_lock_ctx : null;
   const verificationCtxInput = isObject(input.verification_ctx) ? input.verification_ctx : {};
   const learningCtxInput = isObject(input.learning_ctx) ? input.learning_ctx : {};
+  const taskEvalCtxInput = isObject(input.task_eval_ctx) ? input.task_eval_ctx : {};
   const perfCtxInput = isObject(input.perf_ctx) ? input.perf_ctx : {};
 
   const scanDir = toNumberOr(DEFAULT_STATE.scan_dir, input.scan_dir);
@@ -409,6 +606,28 @@ function normalizeState(input: unknown): VisionState {
           ? learningCtxInput.last_selected_label.trim()
           : null
     },
+    task_eval_ctx: {
+      episode_index: Math.max(0, Math.floor(toNumberOr(0, taskEvalCtxInput.episode_index))),
+      finalized: Boolean(taskEvalCtxInput.finalized),
+      last_outcome:
+        taskEvalCtxInput.last_outcome === "success" ||
+        taskEvalCtxInput.last_outcome === "failure" ||
+        taskEvalCtxInput.last_outcome === "pending"
+          ? taskEvalCtxInput.last_outcome
+          : "pending",
+      success_streak: Math.max(0, Math.floor(toNumberOr(0, taskEvalCtxInput.success_streak))),
+      failure_streak: Math.max(0, Math.floor(toNumberOr(0, taskEvalCtxInput.failure_streak))),
+      target_label:
+        typeof taskEvalCtxInput.target_label === "string" && taskEvalCtxInput.target_label.trim()
+          ? canonicalLabel(taskEvalCtxInput.target_label.trim())
+          : null,
+      target_color:
+        typeof taskEvalCtxInput.target_color === "string" && taskEvalCtxInput.target_color.trim()
+          ? taskEvalCtxInput.target_color.trim().toLowerCase()
+          : null,
+      label_mismatch_count: Math.max(0, Math.floor(toNumberOr(0, taskEvalCtxInput.label_mismatch_count))),
+      color_mismatch_count: Math.max(0, Math.floor(toNumberOr(0, taskEvalCtxInput.color_mismatch_count)))
+    },
     perf_ctx: {
       frame_index: Math.max(0, Math.floor(toNumberOr(0, perfCtxInput.frame_index))),
       last_latency_ms: Math.max(0, toNumberOr(0, perfCtxInput.last_latency_ms)),
@@ -485,7 +704,16 @@ function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: n
   return { h, s, v: cMax };
 }
 
-function colorHit(color: NonNullable<TargetSpec["color"]>, h: number, s: number, v: number): boolean {
+function toSupportedFallbackColor(color: string | null): "red" | "blue" | "green" | "yellow" | null {
+  if (!color) return null;
+  const normalized = color.toLowerCase().trim();
+  if (normalized === "red" || normalized === "blue" || normalized === "green" || normalized === "yellow") {
+    return normalized;
+  }
+  return null;
+}
+
+function colorHit(color: "red" | "blue" | "green" | "yellow", h: number, s: number, v: number): boolean {
   if (color === "blue") return h >= 190 && h <= 255 && s >= 0.25 && v >= 0.12;
   if (color === "red") return (h <= 20 || h >= 340) && s >= 0.35 && v >= 0.12;
   if (color === "green") return h >= 75 && h <= 165 && s >= 0.2 && v >= 0.12;
@@ -579,7 +807,7 @@ function largestComponentByMask(mask: Uint8Array, width: number, height: number)
   };
 }
 
-function detectByColorFallback(frameBase64: string, color: NonNullable<TargetSpec["color"]>): PerceivedObject[] {
+function detectByColorFallback(frameBase64: string, color: "red" | "blue" | "green" | "yellow"): PerceivedObject[] {
   const decoded = decodeImage(frameBase64);
   const pixelCount = decoded.width * decoded.height;
   const mask = new Uint8Array(pixelCount);
@@ -957,20 +1185,23 @@ async function analyzePerception(
     notes.push(`OpenAI target confidence too low or target not found: ${selection.decision_reason}`);
   }
 
-  if (parsed.target.color) {
+  const fallbackColor = toSupportedFallbackColor(parsed.target.color);
+  if (fallbackColor) {
     const fbStart = Date.now();
-    const fallbackObjects = detectByColorFallback(frameBase64, parsed.target.color);
+    const fallbackObjects = detectByColorFallback(frameBase64, fallbackColor);
     const selectedFallback = fallbackObjects[0];
     if (selectedFallback) {
-      notes.push(`Fallback color detector used for ${parsed.target.color}`);
+      notes.push(`Fallback color detector used for ${fallbackColor}`);
       return {
-        perception: composePerception(fallbackObjects, selectedFallback, `Fallback detection for ${parsed.target.color}`),
+        perception: composePerception(fallbackObjects, selectedFallback, `Fallback detection for ${fallbackColor}`),
         source: "fallback_color",
         notes: [...notes, `schedule=${schedule.reason}`],
         target_scoring: selection,
         timings_ms: { fast_track: fastTrackMs, full_model: fullModelMs, select: selectMs, fallback: Date.now() - fbStart }
       };
     }
+  } else if (parsed.target.color) {
+    notes.push(`No pixel fallback available for qualifier=${parsed.target.color}`);
   }
 
   if (!selectedFromOpenAI && targetLabel) {
@@ -1359,7 +1590,8 @@ function updateLearning(
   selectedTarget: PerceivedObject | undefined,
   parsed: ParsedInstruction,
   totalLatencyMs: number,
-  recoveryTriggered: boolean
+  recoveryTriggered: boolean,
+  taskOutcome: "pending" | "success" | "failure"
 ): VisionState["learning_ctx"] {
   const next = { ...previous };
   next.frames += 1;
@@ -1397,6 +1629,14 @@ function updateLearning(
     next.align_tolerance = clamp(next.align_tolerance - 0.003, 0.04, 0.14);
   } else if (onTrackRatio > 0.75) {
     next.align_tolerance = clamp(next.align_tolerance + 0.002, 0.04, 0.14);
+  }
+
+  if (taskOutcome === "success") {
+    next.confidence_floor = clamp(next.confidence_floor - 0.01, 0.25, 0.75);
+    next.align_tolerance = clamp(next.align_tolerance + 0.001, 0.04, 0.14);
+  } else if (taskOutcome === "failure") {
+    next.confidence_floor = clamp(next.confidence_floor + 0.015, 0.25, 0.75);
+    next.align_tolerance = clamp(next.align_tolerance - 0.002, 0.04, 0.14);
   }
 
   return next;
@@ -1476,6 +1716,10 @@ function resetStateForInstruction(previous: VisionState, newHash: string): Visio
     target_lock_ctx: null
     ,
     verification_ctx: { ...DEFAULT_STATE.verification_ctx },
+    task_eval_ctx: {
+      ...DEFAULT_STATE.task_eval_ctx,
+      episode_index: previous.task_eval_ctx.episode_index + 1
+    },
     perf_ctx: { ...previous.perf_ctx, cached_perception: null, cached_source: "none" }
   };
 }
@@ -1571,6 +1815,15 @@ export async function POST(request: Request) {
       notes.push("verification off_track streak threshold hit; fail-closed STOP");
     }
     const verificationMs = Date.now() - verificationStart;
+    const taskValidation = evaluateTaskValidation(
+      parsed,
+      state,
+      output.state,
+      perceptionResult.perception,
+      planForValidation,
+      motionScore,
+      recoveryTriggered
+    );
 
     const totalMs = Date.now() - totalStart;
     output.state.verification_ctx = {
@@ -1585,13 +1838,46 @@ export async function POST(request: Request) {
       last_signature: frameSignature
     };
 
+    let persistentMetrics: PersistentTaskMetrics | null = null;
+    const isTerminalOutcome = taskValidation.outcome === "success" || taskValidation.outcome === "failure";
+    const shouldFinalizeOutcome = isTerminalOutcome && !state.task_eval_ctx.finalized;
+    if (shouldFinalizeOutcome) {
+      persistentMetrics = persistTaskOutcome(parsed, taskValidation);
+      notes.push(`task_outcome_persisted=${taskValidation.outcome}`);
+    }
+
+    output.state.task_eval_ctx = {
+      ...output.state.task_eval_ctx,
+      finalized: shouldFinalizeOutcome ? true : state.task_eval_ctx.finalized,
+      last_outcome: taskValidation.outcome,
+      success_streak:
+        taskValidation.outcome === "success"
+          ? state.task_eval_ctx.success_streak + 1
+          : taskValidation.outcome === "failure"
+            ? 0
+            : state.task_eval_ctx.success_streak,
+      failure_streak:
+        taskValidation.outcome === "failure"
+          ? state.task_eval_ctx.failure_streak + 1
+          : taskValidation.outcome === "success"
+            ? 0
+            : state.task_eval_ctx.failure_streak,
+      target_label: parsed.target.label ? canonicalLabel(parsed.target.label) : null,
+      target_color: parsed.target.color || null,
+      label_mismatch_count:
+        state.task_eval_ctx.label_mismatch_count + (taskValidation.checks.target_label_ok ? 0 : 1),
+      color_mismatch_count:
+        state.task_eval_ctx.color_mismatch_count + (taskValidation.checks.target_color_ok ? 0 : 1)
+    };
+
     output.state.learning_ctx = updateLearning(
       state.learning_ctx,
       verification,
       perceptionResult.perception.selected_target,
       parsed,
       totalMs,
-      recoveryTriggered
+      recoveryTriggered,
+      shouldFinalizeOutcome ? taskValidation.outcome : "pending"
     );
     output.state.perf_ctx = {
       frame_index: state.perf_ctx.frame_index + 1,
@@ -1631,6 +1917,7 @@ export async function POST(request: Request) {
             status: verification.status,
             evidence: verification.evidence
           },
+          task_validation: taskValidation,
           learning: {
             frames: output.state.learning_ctx.frames,
             on_track_frames: output.state.learning_ctx.on_track_frames,
@@ -1640,6 +1927,14 @@ export async function POST(request: Request) {
             align_tolerance: output.state.learning_ctx.align_tolerance,
             avg_latency_ms: Number(output.state.learning_ctx.avg_latency_ms.toFixed(2))
           },
+          persistent_task_metrics: persistentMetrics
+            ? {
+                total_success: persistentMetrics.total_success,
+                total_failure: persistentMetrics.total_failure,
+                current_target_key: targetMetricsKey(parsed),
+                current_target_stats: persistentMetrics.by_target[targetMetricsKey(parsed)] || null
+              }
+            : null,
           timings_ms: {
             parse: parseMs,
             signature: signatureMs,
