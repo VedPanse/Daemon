@@ -96,12 +96,42 @@ interface VisionState {
   };
   motion_ctx: {
     consumed: boolean;
+    step_idx: number;
+    total_steps: number;
   };
   target_lock_ctx: {
     label: string;
     bbox: { x: number; y: number; w: number; h: number };
     lost_ticks: number;
   } | null;
+  verification_ctx: {
+    status: "on_track" | "uncertain" | "off_track";
+    confidence: number;
+    on_track_streak: number;
+    off_track_streak: number;
+    last_motion_score: number;
+    last_offset_abs: number;
+    last_area: number;
+    last_signature: number[] | null;
+  };
+  learning_ctx: {
+    confidence_floor: number;
+    align_tolerance: number;
+    frames: number;
+    on_track_frames: number;
+    false_switches: number;
+    recovery_count: number;
+    avg_latency_ms: number;
+    last_selected_label: string | null;
+  };
+  perf_ctx: {
+    frame_index: number;
+    last_latency_ms: number;
+    recommended_interval_ms: number;
+    last_openai_frame: number;
+    cached_perception: Perception | null;
+    cached_source: "openai_vision" | "fallback_color" | "none";
+  };
 }
 
 interface SystemManifestInput {
@@ -134,9 +164,39 @@ const DEFAULT_STATE: VisionState = {
     hash: ""
   },
   motion_ctx: {
-    consumed: false
+    consumed: false,
+    step_idx: 0,
+    total_steps: 0
   },
-  target_lock_ctx: null
+  target_lock_ctx: null,
+  verification_ctx: {
+    status: "uncertain",
+    confidence: 0,
+    on_track_streak: 0,
+    off_track_streak: 0,
+    last_motion_score: 0,
+    last_offset_abs: 0,
+    last_area: 0,
+    last_signature: null
+  },
+  learning_ctx: {
+    confidence_floor: 0.35,
+    align_tolerance: 0.07,
+    frames: 0,
+    on_track_frames: 0,
+    false_switches: 0,
+    recovery_count: 0,
+    avg_latency_ms: 0,
+    last_selected_label: null
+  },
+  perf_ctx: {
+    frame_index: 0,
+    last_latency_ms: 0,
+    recommended_interval_ms: 180,
+    last_openai_frame: -1000,
+    cached_perception: null,
+    cached_source: "none"
+  }
 };
 
 const ALIGN_OFFSET_THRESHOLD = 0.07;
@@ -233,6 +293,18 @@ function envValue(...keys: string[]): string | undefined {
   return undefined;
 }
 
+function asCachedPerception(value: unknown): Perception | null {
+  if (!isObject(value)) return null;
+  if (!Array.isArray(value.objects)) return null;
+  if (typeof value.summary !== "string") return null;
+  if (typeof value.found !== "boolean") return null;
+  if (typeof value.area !== "number") return null;
+  if (typeof value.offset_x !== "number") return null;
+  if (typeof value.center_offset_x !== "number") return null;
+  if (typeof value.confidence !== "number") return null;
+  return value as unknown as Perception;
+}
+
 function normalizeState(input: unknown): VisionState {
   if (!isObject(input)) {
     return { ...DEFAULT_STATE, capabilities: { ...DEFAULT_STATE.capabilities } };
@@ -247,6 +319,9 @@ function normalizeState(input: unknown): VisionState {
   const instructionCtxInput = isObject(input.instruction_ctx) ? input.instruction_ctx : {};
   const motionCtxInput = isObject(input.motion_ctx) ? input.motion_ctx : {};
   const lockInput = isObject(input.target_lock_ctx) ? input.target_lock_ctx : null;
+  const verificationCtxInput = isObject(input.verification_ctx) ? input.verification_ctx : {};
+  const learningCtxInput = isObject(input.learning_ctx) ? input.learning_ctx : {};
+  const perfCtxInput = isObject(input.perf_ctx) ? input.perf_ctx : {};
 
   const scanDir = toNumberOr(DEFAULT_STATE.scan_dir, input.scan_dir);
   const scanTicks = toNumberOr(DEFAULT_STATE.scan_ticks, input.scan_ticks);
@@ -266,7 +341,9 @@ function normalizeState(input: unknown): VisionState {
       hash: toStringOr("", instructionCtxInput.hash)
     },
     motion_ctx: {
-      consumed: Boolean(motionCtxInput.consumed)
+      consumed: Boolean(motionCtxInput.consumed),
+      step_idx: Math.max(0, Math.floor(toNumberOr(0, motionCtxInput.step_idx))),
+      total_steps: Math.max(0, Math.floor(toNumberOr(0, motionCtxInput.total_steps)))
     },
     target_lock_ctx:
       lockInput &&
@@ -290,6 +367,51 @@ function normalizeState(input: unknown): VisionState {
                 : 0
           }
         : null
+    ,
+    verification_ctx: {
+      status:
+        verificationCtxInput.status === "on_track" ||
+        verificationCtxInput.status === "off_track" ||
+        verificationCtxInput.status === "uncertain"
+          ? verificationCtxInput.status
+          : DEFAULT_STATE.verification_ctx.status,
+      confidence: clamp(toNumberOr(DEFAULT_STATE.verification_ctx.confidence, verificationCtxInput.confidence), 0, 1),
+      on_track_streak: Math.max(0, Math.floor(toNumberOr(0, verificationCtxInput.on_track_streak))),
+      off_track_streak: Math.max(0, Math.floor(toNumberOr(0, verificationCtxInput.off_track_streak))),
+      last_motion_score: clamp(toNumberOr(0, verificationCtxInput.last_motion_score), 0, 1),
+      last_offset_abs: Math.max(0, toNumberOr(0, verificationCtxInput.last_offset_abs)),
+      last_area: Math.max(0, toNumberOr(0, verificationCtxInput.last_area)),
+      last_signature:
+        Array.isArray(verificationCtxInput.last_signature) && verificationCtxInput.last_signature.every((v) => typeof v === "number")
+          ? verificationCtxInput.last_signature.slice(0, 8).map((v) => clamp(v, 0, 1))
+          : null
+    },
+    learning_ctx: {
+      confidence_floor: clamp(toNumberOr(DEFAULT_STATE.learning_ctx.confidence_floor, learningCtxInput.confidence_floor), 0.2, 0.8),
+      align_tolerance: clamp(toNumberOr(DEFAULT_STATE.learning_ctx.align_tolerance, learningCtxInput.align_tolerance), 0.04, 0.14),
+      frames: Math.max(0, Math.floor(toNumberOr(0, learningCtxInput.frames))),
+      on_track_frames: Math.max(0, Math.floor(toNumberOr(0, learningCtxInput.on_track_frames))),
+      false_switches: Math.max(0, Math.floor(toNumberOr(0, learningCtxInput.false_switches))),
+      recovery_count: Math.max(0, Math.floor(toNumberOr(0, learningCtxInput.recovery_count))),
+      avg_latency_ms: Math.max(0, toNumberOr(0, learningCtxInput.avg_latency_ms)),
+      last_selected_label:
+        typeof learningCtxInput.last_selected_label === "string" && learningCtxInput.last_selected_label.trim()
+          ? learningCtxInput.last_selected_label.trim()
+          : null
+    },
+    perf_ctx: {
+      frame_index: Math.max(0, Math.floor(toNumberOr(0, perfCtxInput.frame_index))),
+      last_latency_ms: Math.max(0, toNumberOr(0, perfCtxInput.last_latency_ms)),
+      recommended_interval_ms: clamp(Math.round(toNumberOr(180, perfCtxInput.recommended_interval_ms)), 80, 600),
+      last_openai_frame: Math.floor(toNumberOr(-1000, perfCtxInput.last_openai_frame)),
+      cached_perception: asCachedPerception(perfCtxInput.cached_perception),
+      cached_source:
+        perfCtxInput.cached_source === "openai_vision" ||
+        perfCtxInput.cached_source === "fallback_color" ||
+        perfCtxInput.cached_source === "none"
+          ? perfCtxInput.cached_source
+          : "none"
+    }
   };
 }
 
@@ -668,24 +790,46 @@ async function analyzePerception(
   frameBase64: string,
   instruction: string,
   parsed: ParsedInstruction,
-  targetLockCtx: VisionState["target_lock_ctx"]
-): Promise<{ perception: Perception; source: "openai_vision" | "fallback_color" | "none"; notes: string[] }> {
+  targetLockCtx: VisionState["target_lock_ctx"],
+  confidenceFloor: number,
+  cachedPerception: Perception | null,
+  cachedSource: "openai_vision" | "fallback_color" | "none",
+  allowCache: boolean
+): Promise<{
+  perception: Perception;
+  source: "openai_vision" | "fallback_color" | "none";
+  notes: string[];
+  timings_ms: { model: number; fallback: number };
+}> {
   if (shouldBypassPerceptionTask(parsed.task_type)) {
     return {
       perception: composePerception([], undefined, "Perception bypassed for non-visual command"),
       source: "none",
-      notes: ["Perception bypassed due to task type"]
+      notes: ["Perception bypassed due to task type"],
+      timings_ms: { model: 0, fallback: 0 }
+    };
+  }
+
+  if (allowCache && cachedPerception) {
+    return {
+      perception: cachedPerception,
+      source: cachedSource,
+      notes: ["Reused cached perception for fast loop"],
+      timings_ms: { model: 0, fallback: 0 }
     };
   }
 
   const notes: string[] = [];
+  const modelStart = Date.now();
   const openai = await detectObjectsWithOpenAI(frameBase64, instruction);
+  const modelMs = Date.now() - modelStart;
   const selectedFromOpenAI = selectTargetDeterministic(openai.objects, parsed, targetLockCtx);
-  if (selectedFromOpenAI && selectedFromOpenAI.confidence >= OPENAI_MIN_CONFIDENCE) {
+  if (selectedFromOpenAI && selectedFromOpenAI.confidence >= confidenceFloor) {
     return {
       perception: composePerception(openai.objects, selectedFromOpenAI, openai.summary),
       source: "openai_vision",
-      notes: targetLockCtx ? [...notes, `target lock active: ${canonicalLabel(targetLockCtx.label)}`] : notes
+      notes: targetLockCtx ? [...notes, `target lock active: ${canonicalLabel(targetLockCtx.label)}`] : notes,
+      timings_ms: { model: modelMs, fallback: 0 }
     };
   }
 
@@ -696,6 +840,7 @@ async function analyzePerception(
   }
 
   if (parsed.target.color) {
+    const fbStart = Date.now();
     const fallbackObjects = detectByColorFallback(frameBase64, parsed.target.color);
     const selectedFallback = fallbackObjects[0];
     if (selectedFallback) {
@@ -703,7 +848,8 @@ async function analyzePerception(
       return {
         perception: composePerception(fallbackObjects, selectedFallback, `Fallback detection for ${parsed.target.color}`),
         source: "fallback_color",
-        notes
+        notes,
+        timings_ms: { model: modelMs, fallback: Date.now() - fbStart }
       };
     }
   }
@@ -711,7 +857,8 @@ async function analyzePerception(
   return {
     perception: composePerception(openai.objects, selectedFromOpenAI, openai.summary),
     source: openai.objects.length > 0 ? "openai_vision" : "none",
-    notes
+    notes,
+    timings_ms: { model: modelMs, fallback: 0 }
   };
 }
 
@@ -734,45 +881,44 @@ function stopStep(): PlanStep {
   return { type: "STOP" };
 }
 
-function buildMotionPlan(parsed: ParsedInstruction, caps: Capabilities): { plan: PlanStep[]; notes: string[] } {
-  const plan: PlanStep[] = [];
-  const notes: string[] = [];
-
+function buildMotionSteps(parsed: ParsedInstruction, caps: Capabilities): PlanStep[] {
+  const steps: PlanStep[] = [];
   const count = clamp(parsed.count || 1, 1, 10);
 
   if (parsed.pattern === "circle") {
     for (let i = 0; i < count; i += 1) {
       for (let k = 0; k < 4; k += 1) {
-        plan.push(runStep(caps.base_target, caps.base_fwd_token, [0.55], 450));
-        plan.push(runStep(caps.base_target, caps.base_turn_token, [90], 300));
+        steps.push(runStep(caps.base_target, caps.base_fwd_token, [0.55], 420));
+        steps.push(runStep(caps.base_target, caps.base_turn_token, [90], 260));
       }
     }
-    notes.push(`circle macro count=${count}`);
-  } else if (parsed.pattern === "square") {
-    for (let i = 0; i < count; i += 1) {
-      for (let k = 0; k < 4; k += 1) {
-        plan.push(runStep(caps.base_target, caps.base_fwd_token, [0.5], 500));
-        plan.push(runStep(caps.base_target, caps.base_turn_token, [90], 300));
-      }
-    }
-    notes.push(`square macro count=${count}`);
-  } else if (parsed.pattern === "triangle") {
-    for (let i = 0; i < count; i += 1) {
-      for (let k = 0; k < 3; k += 1) {
-        plan.push(runStep(caps.base_target, caps.base_fwd_token, [0.5], 500));
-        plan.push(runStep(caps.base_target, caps.base_turn_token, [120], 320));
-      }
-    }
-    notes.push(`triangle macro count=${count}`);
-  } else {
-    const distance = clamp(parsed.distance_m || 1, 0.1, 10);
-    const duration = clamp(Math.round(distance * 1800), 250, 8000);
-    plan.push(runStep(caps.base_target, caps.base_fwd_token, [0.55], duration));
-    notes.push(`forward macro distance_m=${distance}`);
+    return steps;
   }
 
-  plan.push(stopStep());
-  return { plan, notes };
+  if (parsed.pattern === "square") {
+    for (let i = 0; i < count; i += 1) {
+      for (let k = 0; k < 4; k += 1) {
+        steps.push(runStep(caps.base_target, caps.base_fwd_token, [0.5], 460));
+        steps.push(runStep(caps.base_target, caps.base_turn_token, [90], 280));
+      }
+    }
+    return steps;
+  }
+
+  if (parsed.pattern === "triangle") {
+    for (let i = 0; i < count; i += 1) {
+      for (let k = 0; k < 3; k += 1) {
+        steps.push(runStep(caps.base_target, caps.base_fwd_token, [0.5], 480));
+        steps.push(runStep(caps.base_target, caps.base_turn_token, [120], 300));
+      }
+    }
+    return steps;
+  }
+
+  const distance = clamp(parsed.distance_m || 1, 0.1, 10);
+  const duration = clamp(Math.round(distance * 1800), 250, 8000);
+  steps.push(runStep(caps.base_target, caps.base_fwd_token, [0.55], duration));
+  return steps;
 }
 
 function hasObstacleOnPath(objects: PerceivedObject[], selected: PerceivedObject | undefined): boolean {
@@ -792,6 +938,43 @@ function hasObstacleOnPath(objects: PerceivedObject[], selected: PerceivedObject
   return false;
 }
 
+function computeFrameSignature(frameBase64: string): number[] {
+  const decoded = decodeImage(frameBase64);
+  const quadrants = [
+    { sum: 0, n: 0 },
+    { sum: 0, n: 0 },
+    { sum: 0, n: 0 },
+    { sum: 0, n: 0 }
+  ];
+  let globalSum = 0;
+
+  for (let y = 0; y < decoded.height; y += 8) {
+    for (let x = 0; x < decoded.width; x += 8) {
+      const idx = (y * decoded.width + x) * 4;
+      const lum = (decoded.data[idx] * 0.299 + decoded.data[idx + 1] * 0.587 + decoded.data[idx + 2] * 0.114) / 255;
+      globalSum += lum;
+      const q = (y < decoded.height / 2 ? 0 : 2) + (x < decoded.width / 2 ? 0 : 1);
+      quadrants[q].sum += lum;
+      quadrants[q].n += 1;
+    }
+  }
+
+  const quadMeans = quadrants.map((q) => (q.n > 0 ? q.sum / q.n : 0));
+  const global = globalSum / Math.max(1, quadrants.reduce((acc, q) => acc + q.n, 0));
+  return [global, ...quadMeans].map((v) => clamp(v, 0, 1));
+}
+
+function signatureMotionScore(previous: number[] | null, current: number[]): number {
+  if (!previous || previous.length !== current.length) {
+    return 0;
+  }
+  let sum = 0;
+  for (let i = 0; i < current.length; i += 1) {
+    sum += Math.abs(current[i] - previous[i]);
+  }
+  return clamp(sum / current.length, 0, 1);
+}
+
 function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, perception: Perception) {
   const next: VisionState = {
     ...previous,
@@ -804,6 +987,7 @@ function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, per
   const plan: PlanStep[] = [];
   const notes: string[] = [];
   let policyBranch = "NONE";
+  const alignTolerance = next.learning_ctx.align_tolerance;
 
   const searchSweep = () => {
     next.scan_ticks += 1;
@@ -825,13 +1009,18 @@ function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, per
   if (parsed.task_type === "move-pattern") {
     next.stage = "MOTION_ONLY";
     policyBranch = "MOVE/PATTERN";
+    const steps = buildMotionSteps(parsed, caps);
+    next.motion_ctx.total_steps = steps.length;
 
-    if (!next.motion_ctx.consumed) {
-      const macro = buildMotionPlan(parsed, caps);
-      notes.push(...macro.notes);
-      plan.push(...macro.plan);
-      next.motion_ctx.consumed = true;
+    if (next.motion_ctx.step_idx < steps.length) {
+      const currentStep = steps[next.motion_ctx.step_idx];
+      next.motion_ctx.step_idx += 1;
+      notes.push(`motion step ${next.motion_ctx.step_idx}/${steps.length}`);
+      plan.push(currentStep);
+      plan.push(stopStep());
+      next.motion_ctx.consumed = next.motion_ctx.step_idx >= steps.length;
     } else {
+      next.motion_ctx.consumed = true;
       notes.push("motion macro already emitted for current instruction");
       plan.push(stopStep());
     }
@@ -870,7 +1059,7 @@ function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, per
       }
 
       const off = perception.offset_x;
-      if (Math.abs(off) <= ALIGN_OFFSET_THRESHOLD) {
+      if (Math.abs(off) <= alignTolerance) {
         next.stage = "APPROACH";
         policyBranch = parsed.task_type === "follow" ? "FOLLOW/ALIGN_OK" : "PICK/ALIGN_OK";
         notes.push("Alignment complete; switching to APPROACH");
@@ -947,6 +1136,126 @@ function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, per
   return { state: next, plan, policyBranch, notes };
 }
 
+function buildVerification(
+  parsed: ParsedInstruction,
+  state: VisionState,
+  nextState: VisionState,
+  perception: Perception,
+  motionScore: number
+) {
+  const previous = state.verification_ctx;
+  let status: "on_track" | "uncertain" | "off_track" = "uncertain";
+  let confidence = 0.5;
+  let expectedPhase = "";
+  let observedPhase = "";
+  const evidence: string[] = [];
+
+  if (parsed.task_type === "move-pattern") {
+    expectedPhase = `motion_step_${nextState.motion_ctx.step_idx}/${Math.max(1, nextState.motion_ctx.total_steps)}`;
+    observedPhase = motionScore > 0.01 ? "camera_motion_detected" : "low_camera_motion";
+    confidence = clamp(motionScore * 25, 0, 1);
+    if (nextState.motion_ctx.consumed) {
+      status = "on_track";
+      confidence = Math.max(confidence, 0.75);
+      evidence.push("macro steps completed");
+    } else if (motionScore > 0.01) {
+      status = "on_track";
+      evidence.push("motion observed during macro execution");
+    } else {
+      status = "off_track";
+      evidence.push("insufficient observed motion for commanded macro");
+    }
+  } else {
+    const target = perception.selected_target;
+    const offsetAbs = Math.abs(perception.offset_x);
+    const area = perception.area;
+    expectedPhase = nextState.stage.toLowerCase();
+    observedPhase = target ? `target:${canonicalLabel(target.label)}` : "no_target";
+    if (target) {
+      const offsetTrend = previous.last_offset_abs - offsetAbs;
+      const areaTrend = area - previous.last_area;
+      confidence = clamp(target.confidence * 0.7 + clamp(offsetTrend * 5, -0.2, 0.2) + clamp(areaTrend * 1.5, -0.2, 0.2), 0, 1);
+      if (confidence >= 0.45) {
+        status = "on_track";
+      } else {
+        status = "uncertain";
+      }
+      evidence.push(`offset_abs=${offsetAbs.toFixed(3)}`);
+      evidence.push(`area=${area.toFixed(3)}`);
+    } else if (nextState.stage === "SEARCH") {
+      status = "uncertain";
+      confidence = 0.25;
+      evidence.push("searching without lock");
+    } else {
+      status = "off_track";
+      confidence = 0.1;
+      evidence.push("target missing outside SEARCH");
+    }
+  }
+
+  const onTrackStreak = status === "on_track" ? previous.on_track_streak + 1 : 0;
+  const offTrackStreak = status === "off_track" ? previous.off_track_streak + 1 : 0;
+
+  return {
+    status,
+    confidence,
+    expected_phase: expectedPhase,
+    observed_phase: observedPhase,
+    evidence,
+    on_track_streak: onTrackStreak,
+    off_track_streak: offTrackStreak
+  };
+}
+
+function updateLearning(
+  previous: VisionState["learning_ctx"],
+  verification: { status: "on_track" | "uncertain" | "off_track" },
+  selectedTarget: PerceivedObject | undefined,
+  parsed: ParsedInstruction,
+  totalLatencyMs: number,
+  recoveryTriggered: boolean
+): VisionState["learning_ctx"] {
+  const next = { ...previous };
+  next.frames += 1;
+  if (verification.status === "on_track") {
+    next.on_track_frames += 1;
+  }
+
+  const selectedLabel = selectedTarget ? canonicalLabel(selectedTarget.label) : null;
+  if (
+    next.last_selected_label &&
+    selectedLabel &&
+    selectedLabel !== next.last_selected_label &&
+    parsed.task_type !== "move-pattern" &&
+    parsed.task_type !== "stop"
+  ) {
+    next.false_switches += 1;
+  }
+  next.last_selected_label = selectedLabel;
+
+  if (recoveryTriggered) {
+    next.recovery_count += 1;
+  }
+
+  next.avg_latency_ms = (next.avg_latency_ms * (next.frames - 1) + totalLatencyMs) / next.frames;
+  const onTrackRatio = next.on_track_frames / Math.max(1, next.frames);
+  const switchRatio = next.false_switches / Math.max(1, next.frames);
+
+  if (switchRatio > 0.08) {
+    next.confidence_floor = clamp(next.confidence_floor + 0.02, 0.25, 0.75);
+  } else if (switchRatio < 0.03) {
+    next.confidence_floor = clamp(next.confidence_floor - 0.005, 0.25, 0.75);
+  }
+
+  if (onTrackRatio < 0.45 && next.recovery_count > 1) {
+    next.align_tolerance = clamp(next.align_tolerance - 0.003, 0.04, 0.14);
+  } else if (onTrackRatio > 0.75) {
+    next.align_tolerance = clamp(next.align_tolerance + 0.002, 0.04, 0.14);
+  }
+
+  return next;
+}
+
 function buildAllowedTokenMap(manifest: unknown): Map<string, Set<string>> | null {
   if (!isObject(manifest)) {
     return null;
@@ -1017,8 +1326,11 @@ function resetStateForInstruction(previous: VisionState, newHash: string): Visio
     scan_dir: 1,
     scan_ticks: 0,
     instruction_ctx: { hash: newHash },
-    motion_ctx: { consumed: false },
+    motion_ctx: { consumed: false, step_idx: 0, total_steps: 0 },
     target_lock_ctx: null
+    ,
+    verification_ctx: { ...DEFAULT_STATE.verification_ctx },
+    perf_ctx: { ...previous.perf_ctx, cached_perception: null, cached_source: "none" }
   };
 }
 
@@ -1055,8 +1367,11 @@ export async function POST(request: Request) {
   }
 
   try {
+    const totalStart = Date.now();
+    const parseStart = Date.now();
     const parsed = parseInstruction(instruction);
     const instructionHash = fnv1aHash(normalizeInstruction(instruction));
+    const parseMs = Date.now() - parseStart;
 
     let state = normalizeState(body.state);
     const notes: string[] = [];
@@ -1066,13 +1381,94 @@ export async function POST(request: Request) {
       notes.push("instruction hash changed; state reset for immediate task switch");
     }
 
-    const perceptionResult = await analyzePerception(frameBase64, instruction, parsed, state.target_lock_ctx);
+    const signatureStart = Date.now();
+    const frameSignature = computeFrameSignature(frameBase64);
+    const signatureMs = Date.now() - signatureStart;
+    const motionScore = signatureMotionScore(state.verification_ctx.last_signature, frameSignature);
+
+    const cacheEligible =
+      state.perf_ctx.cached_perception !== null &&
+      state.target_lock_ctx !== null &&
+      state.perf_ctx.frame_index - state.perf_ctx.last_openai_frame <= 2 &&
+      parsed.task_type !== "search";
+
+    const perceptionStart = Date.now();
+    const perceptionResult = await analyzePerception(
+      frameBase64,
+      instruction,
+      parsed,
+      state.target_lock_ctx,
+      state.learning_ctx.confidence_floor,
+      state.perf_ctx.cached_perception,
+      state.perf_ctx.cached_source,
+      cacheEligible
+    );
+    const perceptionMs = Date.now() - perceptionStart;
     notes.push(...perceptionResult.notes);
 
+    const policyStart = Date.now();
     const output = buildPlanAndState(state, parsed, perceptionResult.perception);
+    const policyMs = Date.now() - policyStart;
     output.state.target_lock_ctx = updateTargetLockCtx(state.target_lock_ctx, perceptionResult.perception.selected_target);
+
+    const verificationStart = Date.now();
+    const verification = buildVerification(parsed, state, output.state, perceptionResult.perception, motionScore);
+    let recoveryTriggered = false;
+    let planForValidation = output.plan;
+    let recoveryBranch = output.policyBranch;
+    if (verification.off_track_streak >= 3) {
+      recoveryTriggered = true;
+      planForValidation = [stopStep()];
+      recoveryBranch = `${output.policyBranch}/RECOVERY_STOP`;
+      if (parsed.task_type === "move-pattern") {
+        output.state.motion_ctx = { consumed: false, step_idx: 0, total_steps: 0 };
+      } else {
+        output.state.stage = "SEARCH";
+      }
+      notes.push("verification off_track streak threshold hit; fail-closed STOP");
+    }
+    const verificationMs = Date.now() - verificationStart;
+
+    const totalMs = Date.now() - totalStart;
+    output.state.verification_ctx = {
+      ...output.state.verification_ctx,
+      status: verification.status,
+      confidence: verification.confidence,
+      on_track_streak: verification.on_track_streak,
+      off_track_streak: verification.off_track_streak,
+      last_motion_score: motionScore,
+      last_offset_abs: Math.abs(perceptionResult.perception.offset_x),
+      last_area: perceptionResult.perception.area,
+      last_signature: frameSignature
+    };
+
+    output.state.learning_ctx = updateLearning(
+      state.learning_ctx,
+      verification,
+      perceptionResult.perception.selected_target,
+      parsed,
+      totalMs,
+      recoveryTriggered
+    );
+    output.state.perf_ctx = {
+      frame_index: state.perf_ctx.frame_index + 1,
+      last_latency_ms: totalMs,
+      recommended_interval_ms:
+        verification.status === "on_track"
+          ? clamp(Math.round(140 + totalMs * 0.35), 90, 240)
+          : verification.status === "uncertain"
+            ? clamp(Math.round(180 + totalMs * 0.4), 120, 320)
+            : clamp(Math.round(240 + totalMs * 0.5), 160, 420),
+      last_openai_frame:
+        perceptionResult.source === "openai_vision" && !perceptionResult.notes.includes("Reused cached perception for fast loop")
+          ? state.perf_ctx.frame_index + 1
+          : state.perf_ctx.last_openai_frame,
+      cached_perception: perceptionResult.source === "openai_vision" ? perceptionResult.perception : state.perf_ctx.cached_perception,
+      cached_source: perceptionResult.source === "openai_vision" ? "openai_vision" : state.perf_ctx.cached_source
+    };
+
     const allowedTokenMap = buildAllowedTokenMap(body.system_manifest);
-    const safePlan = sanitizePlanToManifest(output.plan, allowedTokenMap);
+    const safePlan = sanitizePlanToManifest(planForValidation, allowedTokenMap);
 
     return NextResponse.json(
       {
@@ -1080,15 +1476,43 @@ export async function POST(request: Request) {
         perception: perceptionResult.perception,
         plan: safePlan.plan,
         debug: {
-          policy_branch: output.policyBranch,
+          policy_branch: recoveryBranch,
           parsed_instruction: parsed,
           perception_source: perceptionResult.source,
+          verification: {
+            expected_phase: verification.expected_phase,
+            observed_phase: verification.observed_phase,
+            confidence: verification.confidence,
+            status: verification.status,
+            evidence: verification.evidence
+          },
+          learning: {
+            frames: output.state.learning_ctx.frames,
+            on_track_frames: output.state.learning_ctx.on_track_frames,
+            false_switches: output.state.learning_ctx.false_switches,
+            recovery_count: output.state.learning_ctx.recovery_count,
+            confidence_floor: output.state.learning_ctx.confidence_floor,
+            align_tolerance: output.state.learning_ctx.align_tolerance,
+            avg_latency_ms: Number(output.state.learning_ctx.avg_latency_ms.toFixed(2))
+          },
+          timings_ms: {
+            parse: parseMs,
+            signature: signatureMs,
+            perception_model: perceptionResult.timings_ms.model,
+            perception_fallback: perceptionResult.timings_ms.fallback,
+            perception_total: perceptionMs,
+            policy: policyMs,
+            verification: verificationMs,
+            total: totalMs
+          },
           notes: [
             ...notes,
             ...output.notes,
             output.state.target_lock_ctx
               ? `lock=${output.state.target_lock_ctx.label},lost=${output.state.target_lock_ctx.lost_ticks}`
-              : "lock=none"
+              : "lock=none",
+            `motion_score=${motionScore.toFixed(4)}`,
+            `next_interval_ms=${output.state.perf_ctx.recommended_interval_ms}`
           ],
           manifest_guard: {
             enabled: Boolean(allowedTokenMap),

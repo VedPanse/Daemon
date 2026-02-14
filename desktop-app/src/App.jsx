@@ -6,7 +6,7 @@ const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
 const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
 const FRAME_WIDTH = 320;
 const FRAME_HEIGHT = 240;
-const DEFAULT_CAPTURE_INTERVAL_MS = 300;
+const DEFAULT_CAPTURE_INTERVAL_MS = 180;
 const STATUS_POLL_MS = 2000;
 const RUNTIME_IS_TAURI = isTauri();
 
@@ -220,12 +220,14 @@ function App() {
   const overlayCanvasRef = useRef(null);
   const streamRef = useRef(null);
   const liveTimerRef = useRef(null);
+  const liveEnabledRef = useRef(false);
+  const loopIntervalRef = useRef(DEFAULT_CAPTURE_INTERVAL_MS);
   const inFlightRef = useRef(false);
   const stateRef = useRef(INITIAL_STATE);
 
   const [taskPrompt, setTaskPrompt] = useState(DEFAULT_PROMPT);
   const [draftPrompt, setDraftPrompt] = useState(DEFAULT_PROMPT);
-  const [captureIntervalMs] = useState(DEFAULT_CAPTURE_INTERVAL_MS);
+  const [captureIntervalMs, setCaptureIntervalMs] = useState(DEFAULT_CAPTURE_INTERVAL_MS);
   const [liveEnabled, setLiveEnabled] = useState(false);
   const [sendingFrames, setSendingFrames] = useState(false);
   const [dryRun, setDryRun] = useState(false);
@@ -240,6 +242,7 @@ function App() {
   const [lastActionText, setLastActionText] = useState("idle");
   const [lastActionTimestamp, setLastActionTimestamp] = useState("");
   const [errorText, setErrorText] = useState("");
+  const [chartSeries, setChartSeries] = useState([]);
 
   const promptReady = taskPrompt.trim().length > 0;
   const draftReady = draftPrompt.trim().length > 0;
@@ -300,7 +303,7 @@ function App() {
 
   const clearLiveTimer = () => {
     if (liveTimerRef.current) {
-      clearInterval(liveTimerRef.current);
+      clearTimeout(liveTimerRef.current);
       liveTimerRef.current = null;
     }
   };
@@ -345,6 +348,7 @@ function App() {
     inFlightRef.current = false;
     setSendingFrames(false);
     setLiveEnabled(false);
+    liveEnabledRef.current = false;
     releaseCamera();
 
     if (!sendStop) {
@@ -408,6 +412,29 @@ function App() {
       setPerception(visionResponse?.perception || null);
       setLastPlan(nextPlan);
       setLastDebug(visionResponse?.debug || null);
+      const suggestedInterval = Number(nextState?.perf_ctx?.recommended_interval_ms || DEFAULT_CAPTURE_INTERVAL_MS);
+      const boundedInterval = Math.max(80, Math.min(600, suggestedInterval));
+      loopIntervalRef.current = boundedInterval;
+      setCaptureIntervalMs(boundedInterval);
+
+      const verification = visionResponse?.debug?.verification || {};
+      const learning = visionResponse?.debug?.learning || {};
+      const totalLatency = Number(visionResponse?.debug?.timings_ms?.total || 0);
+      setChartSeries((prev) => {
+        const next = [
+          ...prev,
+          {
+            t: Date.now(),
+            verification_conf: Number(verification?.confidence || 0),
+            latency_ms: totalLatency,
+            on_track_ratio:
+              Number(learning?.frames || 0) > 0 ? Number(learning?.on_track_frames || 0) / Number(learning?.frames || 1) : 0,
+            false_switches: Number(learning?.false_switches || 0),
+            recovery_count: Number(learning?.recovery_count || 0)
+          }
+        ];
+        return next.slice(-120);
+      });
       setErrorText("");
 
       if (executePlan) {
@@ -452,12 +479,23 @@ function App() {
       setPerception(null);
       setLastPlan([]);
       setLastDebug(null);
+      setChartSeries([]);
       setErrorText("");
       setLiveEnabled(true);
+      liveEnabledRef.current = true;
+      loopIntervalRef.current = DEFAULT_CAPTURE_INTERVAL_MS;
+      setCaptureIntervalMs(DEFAULT_CAPTURE_INTERVAL_MS);
 
-      liveTimerRef.current = setInterval(() => {
-        executeSingleVisionStep({ executePlan: !dryRun });
-      }, captureIntervalMs);
+      const loop = async () => {
+        if (!liveEnabledRef.current) {
+          return;
+        }
+        await executeSingleVisionStep({ executePlan: !dryRun });
+        if (liveEnabledRef.current) {
+          liveTimerRef.current = setTimeout(loop, loopIntervalRef.current);
+        }
+      };
+      await loop();
     } catch (error) {
       setErrorText(`Camera start failed: ${String(error)}`);
       await stopLoop({ sendStop: false });
@@ -539,6 +577,9 @@ function App() {
         <div><strong>Runtime:</strong> {RUNTIME_IS_TAURI ? "Tauri" : "Browser fallback"}</div>
         <div><strong>Status:</strong> {statusText}</div>
         <div><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</div>
+        <div><strong>Loop ms:</strong> {captureIntervalMs}</div>
+        <div><strong>FPS:</strong> {captureIntervalMs > 0 ? (1000 / captureIntervalMs).toFixed(1) : "-"}</div>
+        <div><strong>Verify:</strong> {String(lastDebug?.verification?.status || "unknown")}</div>
         <div><strong>Last action:</strong> {lastActionText || "-"}</div>
         <div><strong>At:</strong> {lastActionTimestamp || "-"}</div>
         <div><strong>Vision API:</strong> {VERCEL_BASE_URL}</div>
@@ -571,6 +612,47 @@ function App() {
         <section className="panel">
           <h2>Last Plan</h2>
           <pre>{JSON.stringify(lastPlan, null, 2)}</pre>
+        </section>
+
+        <section className="panel">
+          <h2>Learning + Verification Chart</h2>
+          <svg viewBox="0 0 600 220" width="100%" height="220" role="img" aria-label="learning chart">
+            <rect x="0" y="0" width="600" height="220" fill="#0d1117" />
+            {(() => {
+              if (!chartSeries.length) {
+                return <text x="20" y="30" fill="#9fb3c8" fontSize="14">No data yet</text>;
+              }
+              const mapPoints = (arr, valueFn, min, max) =>
+                arr
+                  .map((d, i) => {
+                    const x = (i / Math.max(1, arr.length - 1)) * 580 + 10;
+                    const v = valueFn(d);
+                    const y = 200 - ((Math.max(min, Math.min(max, v)) - min) / Math.max(1e-6, max - min)) * 170;
+                    return `${x},${y}`;
+                  })
+                  .join(" ");
+              const latencyMax = Math.max(200, ...chartSeries.map((d) => d.latency_ms));
+              const pVerify = mapPoints(chartSeries, (d) => d.verification_conf, 0, 1);
+              const pLatency = mapPoints(chartSeries, (d) => d.latency_ms, 0, latencyMax);
+              const pOnTrack = mapPoints(chartSeries, (d) => d.on_track_ratio, 0, 1);
+              return (
+                <>
+                  <polyline points={pVerify} fill="none" stroke="#7dd3fc" strokeWidth="2" />
+                  <polyline points={pOnTrack} fill="none" stroke="#86efac" strokeWidth="2" />
+                  <polyline points={pLatency} fill="none" stroke="#fca5a5" strokeWidth="2" />
+                  <text x="12" y="18" fill="#7dd3fc" fontSize="12">verification confidence</text>
+                  <text x="220" y="18" fill="#86efac" fontSize="12">on_track ratio</text>
+                  <text x="360" y="18" fill="#fca5a5" fontSize="12">latency ms</text>
+                </>
+              );
+            })()}
+          </svg>
+          <div className="metrics">
+            <span>false_switches: {Number(lastDebug?.learning?.false_switches || 0)}</span>
+            <span>recovery_count: {Number(lastDebug?.learning?.recovery_count || 0)}</span>
+            <span>avg_latency_ms: {Number(lastDebug?.learning?.avg_latency_ms || 0).toFixed(1)}</span>
+            <span>confidence_floor: {Number(lastDebug?.learning?.confidence_floor || 0).toFixed(3)}</span>
+          </div>
         </section>
       </main>
     </div>
