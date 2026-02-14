@@ -1,0 +1,33 @@
+daemon_version: '0.1'
+device:
+  name: linetrace_sensor
+  version: 0.1.0
+  node_id: linetrace-sensor
+commands:
+- token: CALIBRATE
+  description: Calibrate line sensor
+  args:
+  - name: level
+    type: int
+    min: 0.0
+    max: 3.0
+    required: true
+  safety:
+    rate_limit_hz: 5
+    watchdog_ms: 800
+    clamp: true
+  nlp:
+    synonyms:
+    - calibrate
+    - calibrate line sensor
+    examples:
+    - Calibrate line sensor
+telemetry:
+  keys:
+  - name: uptime_ms
+    type: int
+    unit: ms
+  - name: last_token
+    type: string
+transport:
+  type: serial-line-v1

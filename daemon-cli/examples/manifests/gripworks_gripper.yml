@@ -1,0 +1,50 @@
+daemon_version: "0.1"
+device:
+  name: gripworks_gripper
+  version: "2.0.1"
+  node_id: gripworks-gripper-01
+  manufacturer: GripWorks
+commands:
+  - token: GRIP
+    description: Open or close gripper fingers
+    args:
+      - name: state
+        type: string
+        enum: ["open", "close"]
+        required: true
+    safety:
+      rate_limit_hz: 15
+      watchdog_ms: 400
+      clamp: true
+    nlp:
+      synonyms: ["grip", "close claw", "open claw"]
+      examples: ["close gripper", "open gripper"]
+  - token: GRIP_FORCE
+    description: Set gripper squeezing force
+    args:
+      - name: n
+        type: float
+        min: 0.0
+        max: 40.0
+        required: true
+    safety:
+      rate_limit_hz: 15
+      watchdog_ms: 400
+      clamp: true
+    nlp:
+      synonyms: ["grip force", "squeeze force"]
+      examples: ["set grip force to 10", "squeeze at 20 newtons"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: grip_state
+      type: string
+    - name: grip_force_n
+      type: float
+      unit: N
+transport:
+  type: serial-line-v1

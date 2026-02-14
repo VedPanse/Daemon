@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import queue
 import socket
@@ -239,7 +240,7 @@ class Orchestrator:
 
     def _node_from_target(self, target: str) -> NodeInfo | None:
         for node in self.nodes:
-            if target == node.node_name:
+            if target in {node.alias, node.node_name, node.node_id}:
                 return node
         return None
 
@@ -249,6 +250,11 @@ class Orchestrator:
             if str(command.get("token", "")).upper() == token_u:
                 return command
         return None
+
+    def _is_token_ambiguous(self, token: str) -> bool:
+        token_u = token.upper()
+        matches = [node for key, node in self.catalog_qualified.items() if key.endswith(f".{token_u}")]
+        return len(matches) > 1
 
     def _validate_arg_value(self, arg_value: Any, arg_spec: dict[str, Any], context: str) -> None:
         arg_type = str(arg_spec.get("type", "")).lower()
@@ -322,20 +328,27 @@ class Orchestrator:
                 continue
 
             target = step.get("target")
-            if not isinstance(target, str) or not target.strip():
-                raise RuntimeError(f"step[{index}] RUN requires non-empty string target")
-
-            node = self._node_from_target(target)
-            if node is None:
-                raise RuntimeError(f"step[{index}] target '{target}' does not match any connected node")
+            if target is not None and (not isinstance(target, str) or not target.strip()):
+                raise RuntimeError(f"step[{index}] RUN target must be a non-empty string when provided")
 
             token = step.get("token")
             if not isinstance(token, str) or not token.strip():
                 raise RuntimeError(f"step[{index}] RUN requires non-empty string token")
 
+            if target is None and self._is_token_ambiguous(token):
+                raise RuntimeError(
+                    f"step[{index}] token '{token.upper()}' is ambiguous across nodes; explicit target is required"
+                )
+
+            try:
+                node = self.resolve_node(target, token)
+            except RuntimeError as exc:
+                raise RuntimeError(f"step[{index}] {exc}") from exc
+
             command_spec = self._command_spec(node, token)
             if command_spec is None:
-                raise RuntimeError(f"step[{index}] token '{token}' not found on node '{target}'")
+                target_name = target if target is not None else node.alias
+                raise RuntimeError(f"step[{index}] token '{token}' not found on node '{target_name}'")
 
             args = step.get("args", [])
             if not isinstance(args, list):
@@ -517,6 +530,10 @@ def fallback_plan(instruction: str) -> dict[str, Any]:
             plan.append({"type": "RUN", "target": "base", "token": "FWD", "args": [0.6], "duration_ms": 2000})
             continue
 
+        if "takeoff" in part:
+            plan.append({"type": "RUN", "token": "THROTTLE", "args": [0.6], "duration_ms": 900})
+            continue
+
         if "forward" in part:
             plan.append({"type": "RUN", "target": "base", "token": "FWD", "args": [0.6], "duration_ms": 1000})
         if "turn left" in part or " left" in f" {part}":
@@ -552,18 +569,109 @@ def make_plan(
                 orchestrator.merged_manifest(),
                 orchestrator.telemetry_snapshot(),
             )
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+            print(f"planner fallback: {exc}")
+        else:
             remote_plan = remote.get("plan")
             if not isinstance(remote_plan, list):
                 raise RuntimeError("Planner response missing valid plan[]")
             orchestrator.validate_plan(remote_plan)
             return remote
-        except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            print(f"planner fallback: {exc}")
 
     local = fallback_plan(instruction)
     local_plan = local.get("plan", [])
     orchestrator.validate_plan(local_plan)
     return local
+
+
+def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
+    execution_lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _read_json_body(self) -> dict[str, Any]:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            if content_length <= 0:
+                raise RuntimeError("request body is required")
+            raw = self.rfile.read(content_length)
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("request body must be valid JSON") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("request body must be a JSON object")
+            return parsed
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path != "/status":
+                self._write_json(404, {"ok": False, "error": "not_found"})
+                return
+
+            nodes_summary: list[dict[str, Any]] = []
+            for node in orchestrator.nodes:
+                nodes_summary.append(
+                    {
+                        "alias": node.alias,
+                        "name": node.node_name or node.alias,
+                        "node_id": node.node_id or node.alias,
+                        "host": node.host,
+                        "port": node.port,
+                        "connected": node.sock is not None and node.running,
+                        "commands": [str(command.get("token", "")) for command in node.manifest.get("commands", [])],
+                    }
+                )
+
+            self._write_json(
+                200,
+                {
+                    "ok": True,
+                    "nodes": nodes_summary,
+                    "system_manifest": orchestrator.merged_manifest(),
+                },
+            )
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path == "/stop":
+                with execution_lock:
+                    orchestrator.emergency_stop()
+                self._write_json(200, {"ok": True})
+                return
+
+            if self.path == "/execute_plan":
+                try:
+                    body = self._read_json_body()
+                    plan = body.get("plan")
+                    if not isinstance(plan, list):
+                        raise RuntimeError("plan must be a list")
+
+                    with execution_lock:
+                        orchestrator.validate_plan(plan)
+                        orchestrator.execute_plan(plan)
+                except Exception as exc:
+                    self._write_json(400, {"ok": False, "error": str(exc)})
+                    return
+
+                self._write_json(200, {"ok": True})
+                return
+
+            self._write_json(404, {"ok": False, "error": "not_found"})
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer((host, port), Handler)
+    print(f"http bridge listening on http://{host}:{port}")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 def repl(orchestrator: Orchestrator, planner_url: str | None) -> None:
@@ -611,17 +719,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--telemetry", action="store_true", help="Subscribe to node telemetry and print it")
     parser.add_argument("--instruction", default=None, help="One-shot instruction (non-interactive)")
     parser.add_argument("--step-timeout", type=float, default=1.0, help="Per-step RUN/STOP response timeout (seconds)")
+    parser.add_argument("--http-host", default="127.0.0.1", help="HTTP bridge bind host")
+    parser.add_argument("--http-port", type=int, default=None, help="HTTP bridge bind port")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     nodes = [parse_node_arg(raw) for raw in args.node]
+    if args.http_port is not None and args.instruction:
+        raise RuntimeError("Use either --instruction one-shot mode or --http-port bridge mode, not both.")
 
     orchestrator = Orchestrator(nodes=nodes, telemetry=args.telemetry, step_timeout_s=args.step_timeout)
     try:
         orchestrator.connect_all()
-        if args.instruction:
+        if args.http_port is not None:
+            run_http_bridge(orchestrator, args.http_host, args.http_port)
+        elif args.instruction:
             planned = make_plan(args.instruction, orchestrator, args.planner_url)
             plan = planned.get("plan", [])
             print(json.dumps(planned, indent=2))

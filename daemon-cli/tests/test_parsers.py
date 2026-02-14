@@ -14,6 +14,14 @@ class AnnotationParserTests(unittest.TestCase):
         self.assertEqual(args[0].minimum, 0)
         self.assertEqual(args[0].maximum, 255)
 
+    def test_parse_string_range_syntax_is_accepted(self):
+        args = parse_args_spec("state:string[open..close]")
+        self.assertEqual(len(args), 1)
+        self.assertEqual(args[0].name, "state")
+        self.assertEqual(args[0].arg_type, "string")
+        self.assertIsNone(args[0].minimum)
+        self.assertIsNone(args[0].maximum)
+
     def test_parse_safety_spec(self):
         safety = parse_safety_spec("rate_hz=20,watchdog_ms=300,clamp=true")
         self.assertEqual(safety.rate_limit_hz, 20)

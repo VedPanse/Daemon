@@ -10,7 +10,8 @@ ANNOTATION_RE = re.compile(
     r'safety="(?P<safety>[^"]+)"(?:\s+function=(?P<function>[A-Za-z_][A-Za-z0-9_]*))?'
 )
 ARG_RE = re.compile(
-    r'^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<type>int|float|bool|string)(?:\[(?P<min>-?\d+(?:\.\d+)?)\.\.(?P<max>-?\d+(?:\.\d+)?)\])?$'
+    r'^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<type>int|float|bool|string)'
+    r'(?:\[(?P<range_min>[^\]]+)\.\.(?P<range_max>[^\]]+)\])?$'
 )
 
 
@@ -24,12 +25,16 @@ def parse_args_spec(raw: str) -> list[ArgSpec]:
         match = ARG_RE.match(chunk)
         if not match:
             raise ValueError(f"Invalid args chunk: {chunk}")
-        minimum = float(match.group("min")) if match.group("min") else None
-        maximum = float(match.group("max")) if match.group("max") else None
+        arg_type = match.group("type")
+        minimum = None
+        maximum = None
+        if match.group("range_min") and match.group("range_max") and arg_type in {"int", "float"}:
+            minimum = float(match.group("range_min"))
+            maximum = float(match.group("range_max"))
         args.append(
             ArgSpec(
                 name=match.group("name"),
-                arg_type=match.group("type"),
+                arg_type=arg_type,
                 minimum=minimum,
                 maximum=maximum,
                 required=True,

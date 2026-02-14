@@ -1,21 +1,24 @@
-# DAEMON Desktop App (MVP)
+# DAEMON Desktop App
 
-Tauri + React desktop app for DAEMON-enabled devices.
+Tauri + React app with a deterministic live camera loop for blue-cube picking demos.
 
 ## Features
-- Enumerate serial ports
-- Connect/disconnect to a selected port
-- Send `HELLO` and `READ_MANIFEST`
-- Parse and display DAEMON command catalog from `MANIFEST ...`
-- Chat input with rule-based planner constrained to manifest commands
-- Execute `RUN <TOKEN> <args>` and `STOP`
-- Show `OK`/`ERR` responses and live `TELEMETRY ...` stream
+- Live webcam preview (`640x480`)
+- Downscaled frame capture (`320x240`, JPEG quality `0.6`, ~`3.3 FPS`)
+- Sends frames to `POST /api/vision_step`
+- Forwards returned plan to local orchestrator `POST /execute_plan`
+- Panic stop button wired to `POST /stop`
+- UI panels for FSM state, perception/bbox overlay, debug metadata, and last plan
 
 ## Run
 ```bash
 npm install
 npm run tauri dev
 ```
+
+## Config
+- `VITE_VERCEL_BASE_URL` (default `https://daemon-ten-chi.vercel.app`)
+- `VITE_ORCHESTRATOR_BASE_URL` (default `http://127.0.0.1:5055`)
 
 ## Build checks
 ```bash

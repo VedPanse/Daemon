@@ -1,0 +1,37 @@
+daemon_version: "0.1"
+device:
+  name: linetrace_sensor
+  version: "0.9.3"
+  node_id: linetrace-sensor-01
+  manufacturer: LineTrace
+commands:
+  - token: CALIBRATE
+    description: Calibrate reflectance sensors
+    args:
+      - name: level
+        type: int
+        min: 0
+        max: 3
+        required: true
+    safety:
+      rate_limit_hz: 5
+      watchdog_ms: 800
+      clamp: true
+    nlp:
+      synonyms: ["calibrate", "sensor calibrate"]
+      examples: ["calibrate level 2"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: line_left
+      type: float
+    - name: line_right
+      type: float
+    - name: reflectance
+      type: float
+transport:
+  type: serial-line-v1

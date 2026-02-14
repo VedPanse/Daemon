@@ -11,6 +11,10 @@ Local multi-node runtime glue for DAEMON node endpoints.
 - Optional telemetry subscription with per-node prefixed output
 - Optional remote planner URL; local fallback planner if remote is unavailable
 - Strict plan validation against per-node manifest command/arg schemas
+- Optional localhost HTTP bridge for desktop control loop integration:
+  - `POST /execute_plan`
+  - `POST /stop`
+  - `GET /status`
 
 ## Token collisions and namespacing
 - If a token appears on one node only, unqualified token routing is allowed.
@@ -59,8 +63,24 @@ python3 orchestrator/orchestrator.py --node base=localhost:7777 --node arm=local
 - `--planner-url https://<domain>/api/plan` call remote planner first
 - `--instruction "forward then close gripper"` one-shot mode (no REPL)
 - `--step-timeout 1.0` per-step RUN/STOP response timeout in seconds
+- `--http-host 127.0.0.1` HTTP bridge host
+- `--http-port 5055` HTTP bridge port (runs server mode)
 
 If planner URL is down/unreachable/invalid, orchestrator prints a warning and falls back to local planning.
+
+## HTTP bridge mode
+```bash
+python3 orchestrator/orchestrator.py \
+  --node base=localhost:7777 \
+  --node arm=localhost:7778 \
+  --http-port 5055
+```
+
+- `POST /execute_plan` body: `{ "plan": [ ... ] }`
+- `POST /stop` body: `{}`
+- `GET /status` returns connected node summary and merged manifest
+
+For the full blue-cube deterministic demo flow, see `orchestrator/BLUE_CUBE_RUNBOOK.md`.
 
 ## Tests
 ```bash

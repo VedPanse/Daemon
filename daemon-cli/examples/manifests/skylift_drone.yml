@@ -1,0 +1,62 @@
+daemon_version: "0.1"
+device:
+  name: skylift_drone
+  version: "1.2.0"
+  node_id: skylift-drone-01
+  manufacturer: SkyLift Robotics
+commands:
+  - token: THROTTLE
+    description: Set main rotor throttle
+    args:
+      - name: p
+        type: float
+        min: 0.0
+        max: 1.0
+        required: true
+    safety:
+      rate_limit_hz: 25
+      watchdog_ms: 300
+      clamp: true
+    nlp:
+      synonyms: ["throttle", "power", "lift"]
+      examples: ["set throttle to 0.5", "increase lift"]
+  - token: YAW
+    description: Rotate around vertical axis
+    args:
+      - name: deg
+        type: float
+        min: -180.0
+        max: 180.0
+        required: true
+    safety:
+      rate_limit_hz: 20
+      watchdog_ms: 300
+      clamp: true
+    nlp:
+      synonyms: ["yaw", "turn in place", "heading"]
+      examples: ["yaw right 30", "set heading -45"]
+  - token: STOP
+    description: Cut throttle safely
+    args: []
+    safety:
+      rate_limit_hz: 10
+      watchdog_ms: 300
+      clamp: true
+    nlp:
+      synonyms: ["stop props", "motor stop"]
+      examples: ["stop drone"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: altitude_m
+      type: float
+      unit: m
+    - name: yaw_deg
+      type: float
+      unit: deg
+transport:
+  type: serial-line-v1

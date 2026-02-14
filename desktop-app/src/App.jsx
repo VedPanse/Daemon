@@ -1,343 +1,323 @@
-import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
-const SERIAL_EVENT = "serial_line";
+const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
+const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
+const FRAME_WIDTH = 320;
+const FRAME_HEIGHT = 240;
+const CAPTURE_INTERVAL_MS = 300;
+const INSTRUCTION = "pick the blue cube";
 
-function parseManifestPayload(rawPayload) {
-  const payload = rawPayload.trim();
+const VERCEL_BASE_URL = import.meta.env.VITE_VERCEL_BASE_URL || DEFAULT_VERCEL_BASE_URL;
+const ORCH_BASE_URL = import.meta.env.VITE_ORCHESTRATOR_BASE_URL || DEFAULT_ORCH_BASE_URL;
 
-  try {
-    return JSON.parse(payload);
-  } catch {
-    // Continue to base64 fallback.
+const INITIAL_STATE = {
+  stage: "SEARCH",
+  scan_dir: 1,
+  scan_ticks: 0,
+  capabilities: {
+    base_target: "base",
+    arm_target: "arm",
+    base_turn_token: "TURN",
+    base_fwd_token: "FWD",
+    arm_grip_token: "GRIP"
   }
+};
 
-  try {
-    const decoded = atob(payload);
-    return JSON.parse(decoded);
-  } catch {
+async function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const full = String(reader.result || "");
+      const base64 = full.includes(",") ? full.split(",")[1] : full;
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function captureFrameBase64(video, canvas) {
+  if (!video || !canvas) {
     return null;
   }
+  if (video.readyState < 2) {
+    return null;
+  }
+
+  canvas.width = FRAME_WIDTH;
+  canvas.height = FRAME_HEIGHT;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    return null;
+  }
+
+  ctx.drawImage(video, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.6));
+  if (!blob) {
+    return null;
+  }
+  return blobToBase64(blob);
 }
 
-function scoreCommand(part, command) {
-  const q = part.toLowerCase();
-  let score = 0;
-
-  const tokenWords = (command.token || "").toLowerCase().split("_");
-  if (tokenWords.every((word) => q.includes(word))) {
-    score += 5;
+async function postJson(url, body) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data?.error || data?.message || `HTTP ${resp.status}`);
   }
-
-  if ((command.desc || "").toLowerCase().split(" ").some((word) => word && q.includes(word))) {
-    score += 3;
-  }
-
-  const synonyms = command.nlp?.synonyms || [];
-  for (const synonym of synonyms) {
-    if (q.includes(String(synonym).toLowerCase())) {
-      score += 4;
-    }
-  }
-
-  return score;
+  return data;
 }
 
-function extractNumbers(text) {
-  const matches = text.match(/-?\d+(?:\.\d+)?/g);
-  return matches ? matches.map((piece) => Number(piece)) : [];
-}
-
-function planCommands(prompt, manifest) {
-  const commands = manifest?.commands || [];
-  if (!commands.length) {
-    return [];
+function drawOverlay(canvas, perception) {
+  if (!canvas) {
+    return;
+  }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return;
   }
 
-  const normalized = prompt.trim().toLowerCase();
-  if (!normalized) {
-    return [];
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  if (!perception?.found || !perception?.bbox) {
+    return;
   }
 
-  if (normalized.includes("stop")) {
-    return [{ token: "STOP", args: [] }];
-  }
+  const sx = w / FRAME_WIDTH;
+  const sy = h / FRAME_HEIGHT;
+  const { x, y, w: bw, h: bh } = perception.bbox;
 
-  const parts = normalized.split(/\bthen\b|\band then\b|,/).map((part) => part.trim()).filter(Boolean);
-  const numbers = extractNumbers(normalized);
-  let numberIndex = 0;
+  ctx.strokeStyle = "#1f7cff";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x * sx, y * sy, bw * sx, bh * sy);
 
-  const plan = [];
-  for (const part of parts) {
-    let best = null;
-    for (const command of commands) {
-      const score = scoreCommand(part, command);
-      if (score > 0 && (!best || score > best.score)) {
-        best = { command, score };
-      }
-    }
-
-    if (!best) {
-      continue;
-    }
-
-    const args = [];
-    for (const arg of best.command.args || []) {
-      if (numberIndex < numbers.length) {
-        args.push(numbers[numberIndex]);
-        numberIndex += 1;
-      } else if (arg.min !== null && arg.min !== undefined) {
-        args.push(arg.min);
-      } else {
-        args.push(0);
-      }
-    }
-
-    plan.push({ token: best.command.token, args });
-  }
-
-  return plan;
+  const label = `blue ${Number(perception.confidence || 0).toFixed(2)}`;
+  ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, monospace";
+  const tw = ctx.measureText(label).width;
+  ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+  ctx.fillRect(x * sx, Math.max(0, y * sy - 22), tw + 14, 20);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(label, x * sx + 7, Math.max(14, y * sy - 8));
 }
 
 function App() {
-  const [ports, setPorts] = useState([]);
-  const [selectedPort, setSelectedPort] = useState("");
-  const [connectedPort, setConnectedPort] = useState("");
-  const [manifest, setManifest] = useState(null);
-  const [telemetry, setTelemetry] = useState([]);
-  const [wireLog, setWireLog] = useState([]);
-  const [chat, setChat] = useState([]);
-  const [draft, setDraft] = useState("");
+  const videoRef = useRef(null);
+  const captureCanvasRef = useRef(null);
+  const overlayCanvasRef = useRef(null);
+  const streamRef = useRef(null);
+  const timerRef = useRef(null);
+  const inFlightRef = useRef(false);
+  const stateRef = useRef(INITIAL_STATE);
+
+  const [liveEnabled, setLiveEnabled] = useState(false);
+  const [sendingFrames, setSendingFrames] = useState(false);
+  const [bridgeConnected, setBridgeConnected] = useState(false);
+  const [fsmState, setFsmState] = useState(INITIAL_STATE);
+  const [perception, setPerception] = useState(null);
+  const [lastPlan, setLastPlan] = useState([]);
+  const [lastDebug, setLastDebug] = useState(null);
   const [errorText, setErrorText] = useState("");
-  const [busy, setBusy] = useState(false);
 
-  const catalog = useMemo(() => manifest?.commands || [], [manifest]);
-
-  const pushLog = (line) => {
-    setWireLog((prev) => [...prev.slice(-199), line]);
-  };
-
-  const refreshPorts = async () => {
-    try {
-      const result = await invoke("list_serial_ports");
-      setPorts(result);
-      if (!selectedPort && result.length > 0) {
-        setSelectedPort(result[0].portName);
-      }
-      setErrorText("");
-    } catch (error) {
-      setErrorText(String(error));
+  const statusText = useMemo(() => {
+    if (!liveEnabled) {
+      return bridgeConnected ? "idle / connected" : "idle / disconnected";
     }
-  };
+    return sendingFrames ? "connected / sending frames" : "connected / waiting";
+  }, [bridgeConnected, liveEnabled, sendingFrames]);
 
   useEffect(() => {
-    refreshPorts();
+    drawOverlay(overlayCanvasRef.current, perception);
+  }, [perception]);
 
-    let unlisten;
-    listen(SERIAL_EVENT, (event) => {
-      const line = String(event.payload || "").trim();
-      if (!line) {
-        return;
-      }
-
-      pushLog(line);
-
-      if (line.startsWith("MANIFEST ")) {
-        const payload = line.slice("MANIFEST ".length);
-        const parsed = parseManifestPayload(payload);
-        if (parsed && Array.isArray(parsed.commands)) {
-          setManifest(parsed);
-          setChat((prev) => [...prev, { role: "assistant", content: `Manifest loaded (${parsed.commands.length} commands).` }]);
-        } else {
-          setChat((prev) => [...prev, { role: "assistant", content: "Manifest payload could not be parsed." }]);
-        }
-      } else if (line.startsWith("TELEMETRY ")) {
-        setTelemetry((prev) => [...prev.slice(-99), line.slice("TELEMETRY ".length)]);
-      } else if (line.startsWith("ERR ")) {
-        setChat((prev) => [...prev, { role: "assistant", content: `Device error: ${line}` }]);
-      }
-    }).then((cleanup) => {
-      unlisten = cleanup;
-    });
-
-    invoke("get_connection_status")
-      .then((status) => {
-        if (status.connected && status.portName) {
-          setConnectedPort(status.portName);
-        }
-      })
-      .catch(() => {});
-
+  useEffect(() => {
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      stopLoop({ sendStop: false });
     };
   }, []);
 
-  const connect = async () => {
-    if (!selectedPort) {
-      setErrorText("Select a serial port first.");
-      return;
+  const stopLoop = async ({ sendStop }) => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
     }
+    inFlightRef.current = false;
+    setSendingFrames(false);
+    setLiveEnabled(false);
 
-    setBusy(true);
-    try {
-      const status = await invoke("connect_serial", { portName: selectedPort, baudRate: 115200 });
-      if (status.connected) {
-        setConnectedPort(status.portName || selectedPort);
-        setManifest(null);
-        setTelemetry([]);
-        setWireLog([]);
-        await invoke("send_serial_line", { line: "HELLO" });
-        await invoke("send_serial_line", { line: "READ_MANIFEST" });
-        setChat((prev) => [...prev, { role: "assistant", content: `Connected to ${selectedPort}. Requested manifest.` }]);
+    if (streamRef.current) {
+      for (const track of streamRef.current.getTracks()) {
+        track.stop();
       }
-      setErrorText("");
-    } catch (error) {
-      setErrorText(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const disconnect = async () => {
-    setBusy(true);
-    try {
-      await invoke("disconnect_serial");
-      setConnectedPort("");
-      setManifest(null);
-      setTelemetry([]);
-      setErrorText("");
-    } catch (error) {
-      setErrorText(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const sendInstruction = async () => {
-    const prompt = draft.trim();
-    if (!prompt || !connectedPort) {
-      return;
+      streamRef.current = null;
     }
 
-    const plan = planCommands(prompt, manifest);
-
-    setChat((prev) => [...prev, { role: "user", content: prompt }]);
-    setDraft("");
-
-    if (!plan.length) {
-      setChat((prev) => [...prev, { role: "assistant", content: "No matching command found in manifest catalog." }]);
-      return;
-    }
-
-    const planText = plan.map((step) => `RUN ${step.token}${step.args.length ? ` ${step.args.join(" ")}` : ""}`).join(" | ");
-    setChat((prev) => [...prev, { role: "assistant", content: `Plan: ${planText}` }]);
-
-    for (const step of plan) {
+    if (sendStop) {
       try {
-        if (step.token === "STOP") {
-          await invoke("send_serial_line", { line: "STOP" });
-        } else {
-          const line = `RUN ${step.token}${step.args.length ? ` ${step.args.join(" ")}` : ""}`;
-          await invoke("send_serial_line", { line });
-        }
+        await postJson(`${ORCH_BASE_URL}/stop`, {});
+        setBridgeConnected(true);
       } catch (error) {
-        setChat((prev) => [...prev, { role: "assistant", content: `Send failed: ${String(error)}` }]);
+        setBridgeConnected(false);
+        setErrorText(`STOP failed: ${String(error)}`);
       }
     }
+  };
+
+  const executeTick = async () => {
+    if (inFlightRef.current || !liveEnabled) {
+      return;
+    }
+
+    inFlightRef.current = true;
+    setSendingFrames(true);
+
+    try {
+      const frame_jpeg_base64 = await captureFrameBase64(videoRef.current, captureCanvasRef.current);
+      if (!frame_jpeg_base64) {
+        return;
+      }
+
+      const visionPayload = {
+        frame_jpeg_base64,
+        instruction: INSTRUCTION,
+        state: stateRef.current,
+        system_manifest: null,
+        telemetry_snapshot: null
+      };
+
+      const visionResponse = await postJson(`${VERCEL_BASE_URL}/api/vision_step`, visionPayload);
+      const nextState = visionResponse?.state || fsmState;
+      const nextPlan = Array.isArray(visionResponse?.plan) ? visionResponse.plan : [];
+
+      stateRef.current = nextState;
+      setFsmState(nextState);
+      setPerception(visionResponse?.perception || null);
+      setLastPlan(nextPlan);
+      setLastDebug(visionResponse?.debug || null);
+      setErrorText("");
+
+      const executeResponse = await postJson(`${ORCH_BASE_URL}/execute_plan`, { plan: nextPlan });
+      if (!executeResponse?.ok) {
+        throw new Error(executeResponse?.error || "execute_plan returned non-ok response");
+      }
+      setBridgeConnected(true);
+
+      if (String(nextState?.stage || "").toUpperCase() === "DONE") {
+        await stopLoop({ sendStop: false });
+      }
+    } catch (error) {
+      setErrorText(String(error));
+      setBridgeConnected(false);
+      await stopLoop({ sendStop: true });
+    } finally {
+      inFlightRef.current = false;
+      setSendingFrames(false);
+    }
+  };
+
+  const startLiveCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480 },
+        audio: false
+      });
+
+      streamRef.current = stream;
+      const video = videoRef.current;
+      if (!video) {
+        throw new Error("video element is unavailable");
+      }
+
+      video.srcObject = stream;
+      await video.play();
+
+      if (overlayCanvasRef.current) {
+        overlayCanvasRef.current.width = 640;
+        overlayCanvasRef.current.height = 480;
+      }
+
+      setFsmState(INITIAL_STATE);
+      stateRef.current = INITIAL_STATE;
+      setPerception(null);
+      setLastPlan([]);
+      setLastDebug(null);
+      setErrorText("");
+      setLiveEnabled(true);
+
+      timerRef.current = setInterval(() => {
+        executeTick();
+      }, CAPTURE_INTERVAL_MS);
+    } catch (error) {
+      setErrorText(`Camera start failed: ${String(error)}`);
+      await stopLoop({ sendStop: false });
+    }
+  };
+
+  const handleLiveToggle = async () => {
+    if (liveEnabled) {
+      await stopLoop({ sendStop: false });
+      return;
+    }
+    await startLiveCamera();
+  };
+
+  const handleStop = async () => {
+    await stopLoop({ sendStop: true });
   };
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <h1>DAEMON Desktop</h1>
-        <div className="connect-row">
-          <select value={selectedPort} onChange={(event) => setSelectedPort(event.target.value)}>
-            {ports.map((port) => (
-              <option key={port.portName} value={port.portName}>
-                {port.portName} ({port.portType})
-              </option>
-            ))}
-            {!ports.length && <option value="">No serial ports</option>}
-          </select>
-          <button onClick={refreshPorts} disabled={busy}>Refresh</button>
-          {!connectedPort && <button onClick={connect} disabled={busy || !selectedPort}>Connect</button>}
-          {connectedPort && <button onClick={disconnect} disabled={busy}>Disconnect</button>}
+    <div className="live-app">
+      <header className="header">
+        <h1>DAEMON Live Camera</h1>
+        <div className="button-row">
+          <button onClick={handleLiveToggle} className={liveEnabled ? "btn-live active" : "btn-live"}>
+            {liveEnabled ? "Disable Live Camera" : "Enable Live Camera"}
+          </button>
+          <button onClick={handleStop} className="btn-stop">
+            STOP
+          </button>
         </div>
       </header>
 
-      <div className="status-row">
-        <span>{connectedPort ? `Connected: ${connectedPort}` : "Disconnected"}</span>
-        {errorText && <span className="error">{errorText}</span>}
-      </div>
+      <section className="status-bar">
+        <span><strong>Status:</strong> {statusText}</span>
+        <span><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</span>
+        <span><strong>Vision API:</strong> {VERCEL_BASE_URL}</span>
+        <span><strong>Orchestrator:</strong> {ORCH_BASE_URL}</span>
+      </section>
 
-      <main className="grid">
-        <section className="panel chat-panel">
-          <h2>Chat</h2>
-          <div className="chat-log">
-            {chat.map((message, idx) => (
-              <div key={`${message.role}-${idx}`} className={`msg ${message.role}`}>
-                <strong>{message.role === "user" ? "You" : "Agent"}:</strong> {message.content}
-              </div>
-            ))}
-            {!chat.length && <div className="empty">Send a natural language command after connecting.</div>}
+      {errorText ? <section className="error-box">{errorText}</section> : null}
+
+      <main className="layout">
+        <section className="panel video-panel">
+          <h2>Live Preview</h2>
+          <div className="video-shell">
+            <video ref={videoRef} autoPlay muted playsInline className="video" />
+            <canvas ref={overlayCanvasRef} className="overlay" />
           </div>
-          <div className="composer">
-            <input
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              placeholder="Example: go forward 30 then turn left 90"
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  sendInstruction();
-                }
-              }}
-            />
-            <button onClick={sendInstruction} disabled={!connectedPort}>Send</button>
-            <button onClick={() => invoke("send_serial_line", { line: "STOP" })} disabled={!connectedPort}>STOP</button>
+          <canvas ref={captureCanvasRef} className="hidden-canvas" />
+          <div className="perception-meta">
+            <div>found: {String(Boolean(perception?.found))}</div>
+            <div>confidence: {Number(perception?.confidence || 0).toFixed(3)}</div>
+            <div>offset_x: {Number(perception?.center_offset_x || 0).toFixed(1)}</div>
+            <div>area: {Number(perception?.area || 0).toFixed(1)}</div>
           </div>
         </section>
 
-        <section className="panel manifest-panel">
-          <h2>Manifest</h2>
-          <div className="manifest-list">
-            {catalog.map((cmd) => (
-              <div key={cmd.token} className="cmd-card">
-                <div className="cmd-token">{cmd.token}</div>
-                <div className="cmd-desc">{cmd.desc}</div>
-                <div className="cmd-args">
-                  {(cmd.args || []).length
-                    ? cmd.args.map((arg) => `${arg.name}:${arg.type}`).join(", ")
-                    : "No args"}
-                </div>
-              </div>
-            ))}
-            {!catalog.length && <div className="empty">Manifest not loaded.</div>}
-          </div>
+        <section className="panel">
+          <h2>Perception + State</h2>
+          <pre>{JSON.stringify({ state: fsmState, perception, debug: lastDebug }, null, 2)}</pre>
         </section>
 
-        <section className="panel telemetry-panel">
-          <h2>Telemetry</h2>
-          <div className="telemetry-log">
-            {telemetry.map((line, idx) => (
-              <div key={`${line}-${idx}`}>{line}</div>
-            ))}
-            {!telemetry.length && <div className="empty">No telemetry yet.</div>}
-          </div>
-        </section>
-
-        <section className="panel wire-panel">
-          <h2>Wire Log</h2>
-          <div className="wire-log">
-            {wireLog.map((line, idx) => (
-              <div key={`${line}-${idx}`}>{line}</div>
-            ))}
-            {!wireLog.length && <div className="empty">No serial messages yet.</div>}
-          </div>
+        <section className="panel">
+          <h2>Last Plan</h2>
+          <pre>{JSON.stringify(lastPlan, null, 2)}</pre>
         </section>
       </main>
     </div>

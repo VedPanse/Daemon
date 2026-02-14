@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+import shutil
 from pathlib import Path
 
 from daemon_cli.build import BuildError, run_build
+from daemon_cli.schema import validate_manifest_schema
 
 
 class BuildTests(unittest.TestCase):
@@ -51,6 +53,26 @@ class BuildTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(BuildError, "export requires function=<name>"):
                 run_build(root)
+
+    def test_build_succeeds_for_manufacturer_examples(self):
+        examples_root = Path(__file__).resolve().parent.parent / "examples" / "firmware_manufacturers"
+        schema_path = Path(__file__).resolve().parent.parent / "schema" / "daemon.schema.v0_1.json"
+
+        for name in ["skylift_drone", "gripworks_gripper", "linetrace_sensor"]:
+            with self.subTest(example=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    src = examples_root / name
+                    dst = Path(temp_dir) / name
+                    shutil.copytree(src, dst)
+                    result = run_build(dst)
+                    generated = Path(result.generated_dir)
+                    manifest_path = generated / "DAEMON.yml"
+                    self.assertTrue(manifest_path.exists())
+
+                    import yaml
+
+                    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+                    validate_manifest_schema(manifest, schema_path)
 
 
 if __name__ == "__main__":

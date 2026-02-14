@@ -2,6 +2,7 @@
 
 This project is the deploy target for DAEMON cloud endpoints. It includes:
 - `POST /api/plan` and `POST /plan` for orchestrator planning
+- `POST /api/vision_step` for deterministic blue-cube servo control
 - `POST /api/v1/daemon-configs/ingest` for CLI publish ingest
 - `GET /api/health` for service health checks
 
@@ -29,6 +30,20 @@ All are optional for MVP:
 
 - `POST /api/plan`
 - `POST /plan` (rewrite to `/api/plan`)
+
+## Vision endpoint (deterministic, no RL)
+
+- `POST /api/vision_step`
+- Input:
+  - `frame_jpeg_base64`
+  - `instruction`
+  - `state` (FSM persisted by caller)
+  - optional `system_manifest`, `telemetry_snapshot`
+- Output:
+  - updated `state`
+  - `perception` (`found`, `bbox`, `area`, `center_offset_x`, `confidence`)
+  - short `plan` for `base`/`arm` (`RUN` + `STOP`)
+  - `debug`
 
 ## Example request
 

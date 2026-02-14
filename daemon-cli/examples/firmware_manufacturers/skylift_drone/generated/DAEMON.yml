@@ -1,0 +1,64 @@
+daemon_version: '0.1'
+device:
+  name: skylift_drone
+  version: 0.1.0
+  node_id: skylift-drone
+commands:
+- token: THROTTLE
+  description: Set drone throttle
+  args:
+  - name: p
+    type: float
+    min: 0.0
+    max: 1.0
+    required: true
+  safety:
+    rate_limit_hz: 25
+    watchdog_ms: 300
+    clamp: true
+  nlp:
+    synonyms:
+    - throttle
+    - set drone throttle
+    examples:
+    - Set drone throttle
+- token: YAW
+  description: Yaw drone heading
+  args:
+  - name: deg
+    type: float
+    min: -180.0
+    max: 180.0
+    required: true
+  safety:
+    rate_limit_hz: 20
+    watchdog_ms: 300
+    clamp: true
+  nlp:
+    synonyms:
+    - yaw
+    - yaw drone heading
+    examples:
+    - Yaw drone heading
+- token: STOP
+  description: Stop propellers
+  args: []
+  safety:
+    rate_limit_hz: 10
+    watchdog_ms: 300
+    clamp: true
+  nlp:
+    synonyms:
+    - stop
+    - stop propellers
+    examples:
+    - Stop propellers
+telemetry:
+  keys:
+  - name: uptime_ms
+    type: int
+    unit: ms
+  - name: last_token
+    type: string
+transport:
+  type: serial-line-v1

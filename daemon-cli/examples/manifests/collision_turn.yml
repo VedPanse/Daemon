@@ -1,0 +1,34 @@
+daemon_version: "0.1"
+device:
+  name: collision_turn_node
+  version: "0.1.0"
+  node_id: collision-turn-node
+  manufacturer: Collision Labs
+commands:
+  - token: TURN
+    description: Turn command with constrained range
+    args:
+      - name: degrees
+        type: float
+        min: -90.0
+        max: 90.0
+        required: true
+    safety:
+      rate_limit_hz: 12
+      watchdog_ms: 450
+      clamp: true
+    nlp:
+      synonyms: ["turn", "yaw", "rotate"]
+      examples: ["turn 30", "yaw -45"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: yaw_deg
+      type: float
+      unit: deg
+transport:
+  type: serial-line-v1

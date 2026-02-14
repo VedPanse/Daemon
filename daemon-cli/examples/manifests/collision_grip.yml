@@ -1,0 +1,33 @@
+daemon_version: "0.1"
+device:
+  name: collision_grip_node
+  version: "0.1.0"
+  node_id: collision-grip-node
+  manufacturer: Collision Labs
+commands:
+  - token: GRIP
+    description: Set PWM grip position byte
+    args:
+      - name: pwm
+        type: int
+        min: 0
+        max: 255
+        required: true
+    safety:
+      rate_limit_hz: 12
+      watchdog_ms: 450
+      clamp: true
+    nlp:
+      synonyms: ["grip", "set gripper pwm"]
+      examples: ["grip 128", "set gripper pwm 200"]
+telemetry:
+  keys:
+    - name: uptime_ms
+      type: int
+      unit: ms
+    - name: last_token
+      type: string
+    - name: pwm
+      type: int
+transport:
+  type: serial-line-v1

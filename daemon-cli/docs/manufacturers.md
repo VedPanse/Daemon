@@ -11,6 +11,12 @@
 - Planner output references node `target` plus token.
 - If a token collides across nodes, plan must use explicit target.
 
+## How multiple manufacturers compose
+- `skylift_drone` (SkyLift Robotics): drone control (`THROTTLE`, `YAW`, `STOP`) plus drone telemetry keys.
+- `gripworks_gripper` (GripWorks): gripper module (`GRIP`, `GRIP_FORCE`) with manipulation telemetry.
+- `linetrace_sensor` (LineTrace): telemetry-heavy sensor node (`CALIBRATE`) for line/reflectance streams.
+- Composition remains runtime-only through manifests and orchestrator routing; firmware binaries stay separate.
+
 ## What is not required
 - No firmware merging across manufacturers.
 - No shared monolithic binary.

@@ -1,0 +1,51 @@
+daemon_version: '0.1'
+device:
+  name: gripworks_gripper
+  version: 0.1.0
+  node_id: gripworks-gripper
+commands:
+- token: GRIP
+  description: Set gripper state
+  args:
+  - name: state
+    type: string
+    min: null
+    max: null
+    required: true
+  safety:
+    rate_limit_hz: 15
+    watchdog_ms: 400
+    clamp: true
+  nlp:
+    synonyms:
+    - grip
+    - set gripper state
+    examples:
+    - Set gripper state
+- token: GRIP_FORCE
+  description: Set gripper force
+  args:
+  - name: n
+    type: float
+    min: 0.0
+    max: 40.0
+    required: true
+  safety:
+    rate_limit_hz: 15
+    watchdog_ms: 400
+    clamp: true
+  nlp:
+    synonyms:
+    - grip_force
+    - set gripper force
+    examples:
+    - Set gripper force
+telemetry:
+  keys:
+  - name: uptime_ms
+    type: int
+    unit: ms
+  - name: last_token
+    type: string
+transport:
+  type: serial-line-v1
