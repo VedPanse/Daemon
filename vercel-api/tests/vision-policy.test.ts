@@ -3,6 +3,7 @@ import {
   canonicalLabel,
   parseInstruction,
   selectTargetDeterministic,
+  selectTargetWithTraceDeterministic,
   shouldBypassPerceptionTask,
   updateTargetLockCtx,
   type ParsedInstruction,
@@ -41,6 +42,12 @@ run("parseInstruction pick-object phone", () => {
   assert.equal(parsed.target.label, "phone");
 });
 
+run("parseInstruction person pick phrase", () => {
+  const parsed = parseInstruction("walk to a person and pick it up");
+  assert.equal(parsed.task_type, "pick-object");
+  assert.equal(parsed.target.label, "person");
+});
+
 run("canonicalLabel phone aliases", () => {
   assert.equal(canonicalLabel("SmartPhone"), "phone");
   assert.equal(canonicalLabel("cell phone"), "phone");
@@ -56,6 +63,17 @@ run("selectTargetDeterministic prefers banana over person distractor", () => {
 
   assert.ok(selected);
   assert.equal(canonicalLabel(String(selected?.label)), "banana");
+});
+
+run("selectTargetDeterministic selects person when person is target", () => {
+  const parsed: ParsedInstruction = parseInstruction("walk to a person and pick it up");
+  const selected = selectTargetDeterministic([
+    obj("person", 0.61, 0.44, 0.2),
+    obj("pillar", 0.97, 0.4, 0.2)
+  ], parsed, null);
+
+  assert.ok(selected);
+  assert.equal(canonicalLabel(String(selected?.label)), "person");
 });
 
 run("selectTargetDeterministic prefers phone alias over person distractor", () => {
@@ -105,6 +123,14 @@ run("move-pattern bypasses perception", () => {
   assert.equal(shouldBypassPerceptionTask("stop"), true);
   assert.equal(shouldBypassPerceptionTask("pick-object"), false);
   assert.equal(shouldBypassPerceptionTask("follow"), false);
+});
+
+run("selection trace marks required target when absent", () => {
+  const parsed = parseInstruction("pick up the banana");
+  const result = selectTargetWithTraceDeterministic([obj("person", 0.9, 0.3, 0.3)], parsed, null);
+  assert.equal(result.target_required, true);
+  assert.equal(result.selected, undefined);
+  assert.equal(result.decision_reason, "target_required_but_no_scored_match");
 });
 
 console.log("All vision policy tests passed.");

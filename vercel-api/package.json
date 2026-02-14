@@ -8,7 +8,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "health:keys": "node scripts/api-health-check.mjs",
-    "test:vision": "tsx tests/vision-policy.test.ts"
+    "test:vision": "tsx tests/vision-policy.test.ts && tsx tests/vision-step.test.ts"
   },
   "dependencies": {
     "@vercel/blob": "0.27.0",

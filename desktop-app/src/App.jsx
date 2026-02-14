@@ -224,6 +224,7 @@ function App() {
   const loopIntervalRef = useRef(DEFAULT_CAPTURE_INTERVAL_MS);
   const inFlightRef = useRef(false);
   const stateRef = useRef(INITIAL_STATE);
+  const appliedPromptRef = useRef(DEFAULT_PROMPT);
 
   const [taskPrompt, setTaskPrompt] = useState(DEFAULT_PROMPT);
   const [draftPrompt, setDraftPrompt] = useState(DEFAULT_PROMPT);
@@ -241,6 +242,7 @@ function App() {
   const [lastOrchestratorError, setLastOrchestratorError] = useState("");
   const [lastActionText, setLastActionText] = useState("idle");
   const [lastActionTimestamp, setLastActionTimestamp] = useState("");
+  const [lastSentInstruction, setLastSentInstruction] = useState("");
   const [errorText, setErrorText] = useState("");
   const [chartSeries, setChartSeries] = useState([]);
 
@@ -268,8 +270,13 @@ function App() {
       return;
     }
     setTaskPrompt(next);
+    appliedPromptRef.current = next;
     setErrorText("");
   };
+
+  useEffect(() => {
+    appliedPromptRef.current = taskPrompt.trim() || DEFAULT_PROMPT;
+  }, [taskPrompt]);
 
   useEffect(() => {
     drawOverlay(overlayCanvasRef.current, perception, lastDebug);
@@ -397,11 +404,13 @@ function App() {
         throw new Error("camera frame unavailable");
       }
 
+      const instructionToSend = appliedPromptRef.current.trim();
       const visionPayload = {
         frame_jpeg_base64,
-        instruction: taskPrompt.trim(),
+        instruction: instructionToSend,
         state: stateRef.current
       };
+      setLastSentInstruction(instructionToSend);
 
       const visionResponse = await postVisionJson(`${VERCEL_BASE_URL}/api/vision_step`, visionPayload);
       const nextState = visionResponse?.state || stateRef.current;
@@ -583,6 +592,8 @@ function App() {
         <div><strong>Last action:</strong> {lastActionText || "-"}</div>
         <div><strong>At:</strong> {lastActionTimestamp || "-"}</div>
         <div><strong>Vision API:</strong> {VERCEL_BASE_URL}</div>
+        <div><strong>Applied instruction:</strong> {taskPrompt}</div>
+        <div><strong>Last sent instruction:</strong> {lastSentInstruction || "-"}</div>
       </section>
 
       {lastOrchestratorError ? <section className="error">Last orchestrator error: {lastOrchestratorError}</section> : null}

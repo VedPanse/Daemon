@@ -5,10 +5,12 @@ import path from "node:path";
 import {
   canonicalLabel,
   parseInstruction as parseInstructionPolicy,
-  selectTargetDeterministic,
+  selectTargetWithTraceDeterministic,
   shouldBypassPerceptionTask,
+  type TargetSelectionResult,
   updateTargetLockCtx
 } from "@/lib/visionPolicy";
+import { computeOpenAIFramePeriod, recommendIntervalMs } from "@/lib/visionPerf";
 
 export const runtime = "nodejs";
 
@@ -147,6 +149,14 @@ interface OpenAIPerception {
   objects: PerceivedObject[];
   summary: string;
   error?: string;
+}
+
+interface PerceptionSchedule {
+  allow_fast_track: boolean;
+  run_full_model: boolean;
+  reason: string;
+  openai_period_frames: number;
+  strong_lock: boolean;
 }
 
 const DEFAULT_STATE: VisionState = {
@@ -786,6 +796,74 @@ function composePerception(objects: PerceivedObject[], selected: PerceivedObject
   };
 }
 
+function projectTrackedBBox(
+  bbox: { x: number; y: number; w: number; h: number },
+  motionScore: number
+): { x: number; y: number; w: number; h: number } {
+  const centerX = bbox.x + bbox.w / 2;
+  const centerPull = clamp(0.5 - centerX, -0.5, 0.5);
+  const dx = clamp(centerPull * motionScore * 0.35, -0.04, 0.04);
+  return {
+    x: clamp(bbox.x + dx, 0, 1 - bbox.w),
+    y: bbox.y,
+    w: bbox.w,
+    h: bbox.h
+  };
+}
+
+function buildPerceptionSchedule(parsed: ParsedInstruction, state: VisionState): PerceptionSchedule {
+  const cached = state.perf_ctx.cached_perception;
+  const lockLabel = state.target_lock_ctx ? canonicalLabel(state.target_lock_ctx.label) : "";
+  const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
+  const targetCompatible = !targetLabel || !lockLabel || targetLabel === lockLabel;
+  const strongLock =
+    state.verification_ctx.status === "on_track" &&
+    state.target_lock_ctx !== null &&
+    state.target_lock_ctx.lost_ticks === 0 &&
+    cached !== null &&
+    cached.selected_target !== undefined &&
+    targetCompatible;
+
+  const period = computeOpenAIFramePeriod(state.verification_ctx.status, strongLock);
+  const framesSinceFull = state.perf_ctx.frame_index - state.perf_ctx.last_openai_frame;
+  const runFullModel = framesSinceFull >= period || parsed.task_type === "search" || !strongLock;
+  const allowFastTrack = strongLock && parsed.task_type !== "search";
+
+  return {
+    allow_fast_track: allowFastTrack,
+    run_full_model: runFullModel,
+    reason: runFullModel ? `full_model_due(period=${period},since=${framesSinceFull})` : `fast_track_only(period=${period},since=${framesSinceFull})`,
+    openai_period_frames: period,
+    strong_lock: strongLock
+  };
+}
+
+function maybeBuildFastTrackPerception(
+  parsed: ParsedInstruction,
+  lockCtx: VisionState["target_lock_ctx"],
+  cachedPerception: Perception | null,
+  motionScore: number
+): Perception | null {
+  if (!lockCtx || !cachedPerception?.selected_target) {
+    return null;
+  }
+
+  const tracked = cachedPerception.selected_target;
+  const trackedLabel = canonicalLabel(tracked.label);
+  const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
+  if (targetLabel && trackedLabel !== targetLabel) {
+    return null;
+  }
+
+  const projected = {
+    ...tracked,
+    bbox: projectTrackedBBox(tracked.bbox, motionScore),
+    confidence: clamp(tracked.confidence * 0.94, 0, 1)
+  };
+
+  return composePerception(cachedPerception.objects, projected, "Fast-track from deterministic lock projection");
+}
+
 async function analyzePerception(
   frameBase64: string,
   instruction: string,
@@ -793,50 +871,90 @@ async function analyzePerception(
   targetLockCtx: VisionState["target_lock_ctx"],
   confidenceFloor: number,
   cachedPerception: Perception | null,
-  cachedSource: "openai_vision" | "fallback_color" | "none",
-  allowCache: boolean
+  schedule: PerceptionSchedule,
+  motionScore: number
 ): Promise<{
   perception: Perception;
   source: "openai_vision" | "fallback_color" | "none";
   notes: string[];
-  timings_ms: { model: number; fallback: number };
+  target_scoring: TargetSelectionResult;
+  timings_ms: { fast_track: number; full_model: number; select: number; fallback: number };
 }> {
   if (shouldBypassPerceptionTask(parsed.task_type)) {
     return {
       perception: composePerception([], undefined, "Perception bypassed for non-visual command"),
       source: "none",
       notes: ["Perception bypassed due to task type"],
-      timings_ms: { model: 0, fallback: 0 }
-    };
-  }
-
-  if (allowCache && cachedPerception) {
-    return {
-      perception: cachedPerception,
-      source: cachedSource,
-      notes: ["Reused cached perception for fast loop"],
-      timings_ms: { model: 0, fallback: 0 }
+      target_scoring: {
+        selected: undefined,
+        target_required: false,
+        decision_reason: "bypass_task_type",
+        scored: []
+      },
+      timings_ms: { fast_track: 0, full_model: 0, select: 0, fallback: 0 }
     };
   }
 
   const notes: string[] = [];
+  const fastTrackStart = Date.now();
+  const fastTracked = schedule.allow_fast_track
+    ? maybeBuildFastTrackPerception(parsed, targetLockCtx, cachedPerception, motionScore)
+    : null;
+  const fastTrackMs = Date.now() - fastTrackStart;
+  if (fastTracked && !schedule.run_full_model) {
+    const selectStart = Date.now();
+    const fastSelection = selectTargetWithTraceDeterministic(fastTracked.objects, parsed, targetLockCtx);
+    const selectMs = Date.now() - selectStart;
+    const selected = fastSelection.selected && fastSelection.selected.confidence >= confidenceFloor ? fastSelection.selected : undefined;
+    return {
+      perception: composePerception(fastTracked.objects, selected, fastTracked.summary),
+      source: "openai_vision",
+      notes: [
+        "Fast-track perception used (full model deferred)",
+        `selection=${selected ? "selected" : "none"}:${fastSelection.decision_reason}`,
+        `schedule=${schedule.reason}`
+      ],
+      target_scoring: fastSelection,
+      timings_ms: { fast_track: fastTrackMs, full_model: 0, select: selectMs, fallback: 0 }
+    };
+  }
+
   const modelStart = Date.now();
   const openai = await detectObjectsWithOpenAI(frameBase64, instruction);
-  const modelMs = Date.now() - modelStart;
-  const selectedFromOpenAI = selectTargetDeterministic(openai.objects, parsed, targetLockCtx);
-  if (selectedFromOpenAI && selectedFromOpenAI.confidence >= confidenceFloor) {
+  const fullModelMs = Date.now() - modelStart;
+  const selectStart = Date.now();
+  const selection = selectTargetWithTraceDeterministic(openai.objects, parsed, targetLockCtx);
+  let selectedFromOpenAI = selection.selected && selection.selected.confidence >= confidenceFloor ? selection.selected : undefined;
+  const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
+  if (!selectedFromOpenAI && targetLabel) {
+    const matching = openai.objects
+      .filter((candidate) => canonicalLabel(candidate.label) === targetLabel && candidate.confidence >= confidenceFloor)
+      .sort((a, b) => b.confidence - a.confidence);
+    if (matching.length > 0) {
+      selectedFromOpenAI = matching[0];
+      notes.push(`selection contract fallback applied for target=${targetLabel}`);
+    }
+  }
+  const selectMs = Date.now() - selectStart;
+
+  if (selectedFromOpenAI) {
     return {
       perception: composePerception(openai.objects, selectedFromOpenAI, openai.summary),
       source: "openai_vision",
-      notes: targetLockCtx ? [...notes, `target lock active: ${canonicalLabel(targetLockCtx.label)}`] : notes,
-      timings_ms: { model: modelMs, fallback: 0 }
+      notes: [
+        ...(targetLockCtx ? [`target lock active: ${canonicalLabel(targetLockCtx.label)}`] : []),
+        `selection=selected:${selection.decision_reason}`,
+        `schedule=${schedule.reason}`
+      ],
+      target_scoring: selection,
+      timings_ms: { fast_track: fastTrackMs, full_model: fullModelMs, select: selectMs, fallback: 0 }
     };
   }
 
   if (openai.error) {
     notes.push(`OpenAI unavailable: ${openai.error}`);
   } else {
-    notes.push("OpenAI target confidence too low or target not found");
+    notes.push(`OpenAI target confidence too low or target not found: ${selection.decision_reason}`);
   }
 
   if (parsed.target.color) {
@@ -848,17 +966,26 @@ async function analyzePerception(
       return {
         perception: composePerception(fallbackObjects, selectedFallback, `Fallback detection for ${parsed.target.color}`),
         source: "fallback_color",
-        notes,
-        timings_ms: { model: modelMs, fallback: Date.now() - fbStart }
+        notes: [...notes, `schedule=${schedule.reason}`],
+        target_scoring: selection,
+        timings_ms: { fast_track: fastTrackMs, full_model: fullModelMs, select: selectMs, fallback: Date.now() - fbStart }
       };
+    }
+  }
+
+  if (!selectedFromOpenAI && targetLabel) {
+    const hasMatching = openai.objects.some((candidate) => canonicalLabel(candidate.label) === targetLabel && candidate.confidence >= confidenceFloor);
+    if (hasMatching) {
+      notes.push(`ERROR: matching target ${targetLabel} present but selected_target null after fallback`);
     }
   }
 
   return {
     perception: composePerception(openai.objects, selectedFromOpenAI, openai.summary),
     source: openai.objects.length > 0 ? "openai_vision" : "none",
-    notes,
-    timings_ms: { model: modelMs, fallback: 0 }
+    notes: [...notes, `selection=none:${selection.decision_reason}`, `schedule=${schedule.reason}`],
+    target_scoring: selection,
+    timings_ms: { fast_track: fastTrackMs, full_model: fullModelMs, select: selectMs, fallback: 0 }
   };
 }
 
@@ -1169,16 +1296,35 @@ function buildVerification(
     const target = perception.selected_target;
     const offsetAbs = Math.abs(perception.offset_x);
     const area = perception.area;
+    const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
     expectedPhase = nextState.stage.toLowerCase();
     observedPhase = target ? `target:${canonicalLabel(target.label)}` : "no_target";
     if (target) {
       const offsetTrend = previous.last_offset_abs - offsetAbs;
       const areaTrend = area - previous.last_area;
-      confidence = clamp(target.confidence * 0.7 + clamp(offsetTrend * 5, -0.2, 0.2) + clamp(areaTrend * 1.5, -0.2, 0.2), 0, 1);
-      if (confidence >= 0.45) {
-        status = "on_track";
+      const personPickMode = parsed.task_type === "pick-object" && targetLabel === "person";
+
+      if (personPickMode) {
+        if (offsetTrend > 0.005 && areaTrend > 0.001) {
+          status = "on_track";
+          confidence = clamp(target.confidence * 0.75 + 0.2, 0, 1);
+          evidence.push("person-pick trend positive: offset decreased and area increased");
+        } else if (offsetTrend > 0 || areaTrend > 0) {
+          status = "uncertain";
+          confidence = clamp(target.confidence * 0.55, 0, 1);
+          evidence.push("person-pick trend mixed");
+        } else {
+          status = "off_track";
+          confidence = clamp(target.confidence * 0.35, 0, 1);
+          evidence.push("person-pick trend negative");
+        }
       } else {
-        status = "uncertain";
+        confidence = clamp(target.confidence * 0.7 + clamp(offsetTrend * 5, -0.2, 0.2) + clamp(areaTrend * 1.5, -0.2, 0.2), 0, 1);
+        if (confidence >= 0.45) {
+          status = "on_track";
+        } else {
+          status = "uncertain";
+        }
       }
       evidence.push(`offset_abs=${offsetAbs.toFixed(3)}`);
       evidence.push(`area=${area.toFixed(3)}`);
@@ -1386,11 +1532,8 @@ export async function POST(request: Request) {
     const signatureMs = Date.now() - signatureStart;
     const motionScore = signatureMotionScore(state.verification_ctx.last_signature, frameSignature);
 
-    const cacheEligible =
-      state.perf_ctx.cached_perception !== null &&
-      state.target_lock_ctx !== null &&
-      state.perf_ctx.frame_index - state.perf_ctx.last_openai_frame <= 2 &&
-      parsed.task_type !== "search";
+    const schedule = buildPerceptionSchedule(parsed, state);
+    notes.push(`perception_schedule=${schedule.reason}`);
 
     const perceptionStart = Date.now();
     const perceptionResult = await analyzePerception(
@@ -1400,8 +1543,8 @@ export async function POST(request: Request) {
       state.target_lock_ctx,
       state.learning_ctx.confidence_floor,
       state.perf_ctx.cached_perception,
-      state.perf_ctx.cached_source,
-      cacheEligible
+      schedule,
+      motionScore
     );
     const perceptionMs = Date.now() - perceptionStart;
     notes.push(...perceptionResult.notes);
@@ -1453,14 +1596,9 @@ export async function POST(request: Request) {
     output.state.perf_ctx = {
       frame_index: state.perf_ctx.frame_index + 1,
       last_latency_ms: totalMs,
-      recommended_interval_ms:
-        verification.status === "on_track"
-          ? clamp(Math.round(140 + totalMs * 0.35), 90, 240)
-          : verification.status === "uncertain"
-            ? clamp(Math.round(180 + totalMs * 0.4), 120, 320)
-            : clamp(Math.round(240 + totalMs * 0.5), 160, 420),
+      recommended_interval_ms: recommendIntervalMs(verification.status, totalMs, schedule.strong_lock),
       last_openai_frame:
-        perceptionResult.source === "openai_vision" && !perceptionResult.notes.includes("Reused cached perception for fast loop")
+        perceptionResult.timings_ms.full_model > 0
           ? state.perf_ctx.frame_index + 1
           : state.perf_ctx.last_openai_frame,
       cached_perception: perceptionResult.source === "openai_vision" ? perceptionResult.perception : state.perf_ctx.cached_perception,
@@ -1476,9 +1614,16 @@ export async function POST(request: Request) {
         perception: perceptionResult.perception,
         plan: safePlan.plan,
         debug: {
+          applied_instruction: instruction.trim(),
+          instruction_hash: instructionHash,
           policy_branch: recoveryBranch,
           parsed_instruction: parsed,
           perception_source: perceptionResult.source,
+          target_scoring: {
+            decision_reason: perceptionResult.target_scoring.decision_reason,
+            target_required: perceptionResult.target_scoring.target_required,
+            top_candidates: perceptionResult.target_scoring.scored.slice(0, 5)
+          },
           verification: {
             expected_phase: verification.expected_phase,
             observed_phase: verification.observed_phase,
@@ -1498,7 +1643,10 @@ export async function POST(request: Request) {
           timings_ms: {
             parse: parseMs,
             signature: signatureMs,
-            perception_model: perceptionResult.timings_ms.model,
+            fast_track: perceptionResult.timings_ms.fast_track,
+            full_model: perceptionResult.timings_ms.full_model,
+            select: perceptionResult.timings_ms.select,
+            perception_model: perceptionResult.timings_ms.full_model,
             perception_fallback: perceptionResult.timings_ms.fallback,
             perception_total: perceptionMs,
             policy: policyMs,

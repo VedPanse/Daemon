@@ -31,6 +31,32 @@ export interface TargetLockCtx {
 }
 
 const PERSON_ALIASES = ["person", "human", "man", "woman", "people"];
+const PERSON_CANONICAL = "person";
+
+export interface TargetScoreTrace {
+  label: string;
+  canonical_label: string;
+  confidence: number;
+  total_score: number;
+  components: {
+    confidence: number;
+    exact_label: number;
+    partial_label: number;
+    query_token: number;
+    color: number;
+    mismatch_penalty: number;
+    person_distractor_penalty: number;
+    lock_label: number;
+    lock_distance: number;
+  };
+}
+
+export interface TargetSelectionResult {
+  selected?: PerceivedObject;
+  target_required: boolean;
+  decision_reason: string;
+  scored: TargetScoreTrace[];
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -88,8 +114,9 @@ function cleanTargetPhrase(value: string | null): string | null {
 
 function extractTargetQuery(text: string): string | null {
   const patterns = [
+    /(?:walk|go|move|head|approach)\s+(?:to|toward|towards)\s+(?:the\s+|a\s+|an\s+)?(.+?)(?:\s+and\s+(?:pick(?:\s+\w+)?\s+up|grab)\b|$)/,
     /search for\s+(.+?)(?:\s+and\s+|$)/,
-    /pick up\s+(?:the\s+)?(.+?)$/,
+    /pick(?:\s+\w+)?\s+up\s+(?:the\s+)?(.+?)$/,
     /grab\s+(?:the\s+)?(.+?)$/,
     /follow\s+(?:the\s+)?(.+?)$/,
     /approach\s+(?:the\s+)?(.+?)$/
@@ -126,7 +153,7 @@ function extractLabel(query: string | null): string | null {
   if (tokens.length === 0) return null;
 
   const joined = tokens.join(" ");
-  const canonical = ["phone", "banana", "cube", "box", "bottle", "backpack", "obstacle", "car", "rc car"];
+  const canonical = ["person", "phone", "banana", "cube", "box", "bottle", "backpack", "obstacle", "car", "rc car"];
   for (const item of canonical) {
     if (joined.includes(item)) {
       return item;
@@ -139,6 +166,7 @@ function extractLabel(query: string | null): string | null {
 export function canonicalLabel(raw: string): string {
   const label = raw.toLowerCase().trim();
   const aliases: Array<{ canonical: string; terms: string[] }> = [
+    { canonical: "person", terms: ["person", "human", "man", "woman", "someone", "people"] },
     { canonical: "phone", terms: ["phone", "cell phone", "mobile phone", "smartphone", "iphone", "android phone"] },
     { canonical: "bottle", terms: ["bottle", "water bottle"] },
     { canonical: "backpack", terms: ["backpack", "bag", "rucksack"] },
@@ -158,11 +186,14 @@ export function canonicalLabel(raw: string): string {
 
 export function parseInstruction(instruction: string): ParsedInstruction {
   const text = instruction.toLowerCase().replace(/\s+/g, " ").trim();
-  const targetQuery = extractTargetQuery(text);
+  let targetQuery = extractTargetQuery(text);
+  if (!targetQuery && /\b(?:person|human|man|woman|someone|people)\b/.test(text)) {
+    targetQuery = PERSON_CANONICAL;
+  }
   const target: TargetSpec = {
     query: targetQuery,
     color: extractColor(targetQuery),
-    label: extractLabel(targetQuery)
+    label: targetQuery ? canonicalLabel(extractLabel(targetQuery) || targetQuery) : null
   };
 
   if (/(emergency stop|e-stop|estop|abort|halt|\bstop\b)/.test(text)) {
@@ -204,7 +235,7 @@ export function parseInstruction(instruction: string): ParsedInstruction {
     return { task_type: "avoid+approach", target };
   }
 
-  if (/pick up|grab/.test(text)) {
+  if (/pick(?:\s+\w+)?\s+up|grab/.test(text)) {
     return { task_type: "pick-object", target };
   }
 
@@ -237,7 +268,22 @@ export function selectTargetDeterministic(
   parsed: ParsedInstruction,
   lockCtx?: TargetLockCtx | null
 ): PerceivedObject | undefined {
-  if (objects.length === 0) return undefined;
+  return selectTargetWithTraceDeterministic(objects, parsed, lockCtx).selected;
+}
+
+export function selectTargetWithTraceDeterministic(
+  objects: PerceivedObject[],
+  parsed: ParsedInstruction,
+  lockCtx?: TargetLockCtx | null
+): TargetSelectionResult {
+  if (objects.length === 0) {
+    return {
+      selected: undefined,
+      target_required: false,
+      decision_reason: "no_objects",
+      scored: []
+    };
+  }
 
   const targetLabel = parsed.target.label ? canonicalLabel(parsed.target.label) : "";
   const targetColor = parsed.target.color || null;
@@ -250,31 +296,55 @@ export function selectTargetDeterministic(
   const scored = objects.map((obj) => {
     const label = canonicalLabel(obj.label);
     const attrs = (obj.attributes || []).map((v) => v.toLowerCase());
-    let score = obj.confidence;
-
-    if (targetLabel && label === targetLabel) score += 3.2;
-    if (targetLabel && label.includes(targetLabel)) score += 1.6;
-    if (queryTokens.length > 0 && queryTokens.some((t) => label.includes(t))) score += 0.9;
-    if (targetColor && (label.includes(targetColor) || attrs.some((a) => a.includes(targetColor)))) score += 0.8;
-
-    if (targetLabel && label && label !== targetLabel) {
-      score -= 0.9;
-    }
-
-    if (targetLabel && targetLabel !== "person" && isPersonLike(label)) {
-      score -= 2.2;
-    }
+    const exactLabel = targetLabel && label === targetLabel ? 3.2 : 0;
+    const partialLabel = targetLabel && label.includes(targetLabel) ? 1.6 : 0;
+    const queryMatch = queryTokens.length > 0 && queryTokens.some((t) => label.includes(t)) ? 0.9 : 0;
+    const colorMatch = targetColor && (label.includes(targetColor) || attrs.some((a) => a.includes(targetColor))) ? 0.8 : 0;
+    const mismatchPenalty = targetLabel && label && label !== targetLabel ? -0.9 : 0;
+    const personDistractorPenalty = targetLabel && targetLabel !== PERSON_CANONICAL && isPersonLike(label) ? -2.2 : 0;
+    let lockLabelBonus = 0;
+    let lockDistanceBonus = 0;
 
     if (lockCtx) {
       const lockLabel = canonicalLabel(lockCtx.label);
       if (label === lockLabel) {
-        score += 1.4;
+        lockLabelBonus = 1.4;
         const d = bboxCenterDistance(obj.bbox, lockCtx.bbox);
-        score += Math.max(0, 0.8 - d * 1.5);
+        lockDistanceBonus = Math.max(0, 0.8 - d * 1.5);
       }
     }
 
-    return { obj, score };
+    const score =
+      obj.confidence +
+      exactLabel +
+      partialLabel +
+      queryMatch +
+      colorMatch +
+      mismatchPenalty +
+      personDistractorPenalty +
+      lockLabelBonus +
+      lockDistanceBonus;
+
+    return {
+      obj,
+      trace: {
+        label: obj.label,
+        canonical_label: label,
+        confidence: obj.confidence,
+        total_score: Number(score.toFixed(4)),
+        components: {
+          confidence: Number(obj.confidence.toFixed(4)),
+          exact_label: Number(exactLabel.toFixed(4)),
+          partial_label: Number(partialLabel.toFixed(4)),
+          query_token: Number(queryMatch.toFixed(4)),
+          color: Number(colorMatch.toFixed(4)),
+          mismatch_penalty: Number(mismatchPenalty.toFixed(4)),
+          person_distractor_penalty: Number(personDistractorPenalty.toFixed(4)),
+          lock_label: Number(lockLabelBonus.toFixed(4)),
+          lock_distance: Number(lockDistanceBonus.toFixed(4))
+        }
+      }
+    };
   });
 
   const targetRequired =
@@ -296,22 +366,42 @@ export function selectTargetDeterministic(
   if (targetRequired) {
     const filtered = scored.filter(({ obj }) => matchesTarget(obj));
     if (filtered.length > 0) {
-      filtered.sort((a, b) => b.score - a.score);
+      filtered.sort((a, b) => b.trace.total_score - a.trace.total_score);
       const bestFiltered = filtered[0];
-      if (bestFiltered.score >= 0.2) {
-        return bestFiltered.obj;
+      if (bestFiltered.trace.total_score >= 0.2) {
+        return {
+          selected: bestFiltered.obj,
+          target_required: targetRequired,
+          decision_reason: "target_match_found",
+          scored: scored.sort((a, b) => b.trace.total_score - a.trace.total_score).map((entry) => entry.trace)
+        };
       }
     }
-    return undefined;
+    return {
+      selected: undefined,
+      target_required: targetRequired,
+      decision_reason: "target_required_but_no_scored_match",
+      scored: scored.sort((a, b) => b.trace.total_score - a.trace.total_score).map((entry) => entry.trace)
+    };
   }
 
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => b.trace.total_score - a.trace.total_score);
   const best = scored[0];
-  if (!best || best.score < 0.2) {
-    return undefined;
+  if (!best || best.trace.total_score < 0.2) {
+    return {
+      selected: undefined,
+      target_required: targetRequired,
+      decision_reason: "best_score_below_threshold",
+      scored: scored.map((entry) => entry.trace)
+    };
   }
 
-  return best.obj;
+  return {
+    selected: best.obj,
+    target_required: targetRequired,
+    decision_reason: "best_candidate_selected",
+    scored: scored.map((entry) => entry.trace)
+  };
 }
 
 export function updateTargetLockCtx(
