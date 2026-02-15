@@ -1,4 +1,5 @@
 #include <AFMotor.h>
+#include <string.h>
 
 AF_DCMotor FL(1);
 AF_DCMotor FR(4);
@@ -67,6 +68,66 @@ void rotateRight(){
   FR.run(FORWARD);
   RL.run(BACKWARD);
   RR.run(BACKWARD);
+}
+
+// DAEMON export wrappers: keep primitive motor routines unchanged while exposing
+// stable NLP-friendly command tokens for generated manifests/dispatchers.
+// @daemon:export token=FWD desc="Move forward" args="speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_fwd
+void daemon_cmd_fwd(float speed) {
+  (void)speed;
+  forward();
+}
+
+// @daemon:export token=BWD desc="Move backward" args="speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_bwd
+void daemon_cmd_bwd(float speed) {
+  (void)speed;
+  backward();
+}
+
+// @daemon:export token=STRAFE desc="Strafe left/right" args="dir:string,speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_strafe
+void daemon_cmd_strafe(const char* dir, float speed) {
+  (void)speed;
+  if (dir && (strcmp(dir, "L") == 0 || strcmp(dir, "l") == 0)) {
+    strafeLeft();
+    return;
+  }
+  if (dir && (strcmp(dir, "R") == 0 || strcmp(dir, "r") == 0)) {
+    strafeRight();
+    return;
+  }
+  stopAll();
+}
+
+// @daemon:export token=TURN desc="Rotate in place by signed degrees" args="degrees:float[-180..180]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_turn
+void daemon_cmd_turn(float degrees) {
+  if (degrees < 0) {
+    rotateLeft();
+  } else if (degrees > 0) {
+    rotateRight();
+  } else {
+    stopAll();
+  }
+}
+
+// @daemon:export token=MECANUM desc="Direct primitive command (F,B,L,R,Q,E,S)" args="cmd:string" safety="rate_hz=30,watchdog_ms=1200,clamp=true" function=daemon_cmd_mecanum
+void daemon_cmd_mecanum(const char* cmd) {
+  if (!cmd || !cmd[0]) {
+    stopAll();
+    return;
+  }
+  char c = cmd[0];
+  if (c == 'F') forward();
+  else if (c == 'B') backward();
+  else if (c == 'L') strafeLeft();
+  else if (c == 'R') strafeRight();
+  else if (c == 'Q') rotateLeft();
+  else if (c == 'E') rotateRight();
+  else stopAll();
+}
+
+// @daemon:export token=STOP desc="Stop all motors" args="" safety="rate_hz=30,watchdog_ms=1200,clamp=true" function=daemon_cmd_stop
+void daemon_cmd_stop() {
+  stopAll();
 }
 
 void setup() {

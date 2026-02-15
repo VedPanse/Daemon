@@ -104,12 +104,31 @@ def handle_build(_args: argparse.Namespace) -> int:
     desktop_app = root / "desktop-app"
     vercel_api = root / "vercel-api"
     orchestrator_dir = root / "orchestrator"
+    daemon_cli_root = root / "daemon-cli"
+    firmware_profile_dir = daemon_cli_root / "firmware-code" / "profiles" / "rc_car_pi_arduino" / "arduino"
+    daemon_cli_venv_python = daemon_cli_root / ".venv" / "bin" / "python"
 
-    for required in [desktop_app, vercel_api, orchestrator_dir]:
+    for required in [desktop_app, vercel_api, orchestrator_dir, daemon_cli_root, firmware_profile_dir]:
         if not required.exists():
             raise RuntimeError(f"Required path not found: {required}")
 
     handle_clean(argparse.Namespace(silent=True))
+
+    # Generate DAEMON artifacts from firmware exports first.
+    if daemon_cli_venv_python.exists():
+        _run(
+            [
+                str(daemon_cli_venv_python),
+                "-m",
+                "daemon_cli.cli",
+                "build",
+                "--firmware-dir",
+                str(firmware_profile_dir),
+            ],
+            daemon_cli_root,
+        )
+    else:
+        _run(["./daemon", "build", "--firmware-dir", str(firmware_profile_dir)], daemon_cli_root)
 
     _run(["npm", "install"], desktop_app)
     _run(["npm", "install"], vercel_api)

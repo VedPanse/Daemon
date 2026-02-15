@@ -1375,10 +1375,10 @@ function buildPlanAndState(previous: VisionState, parsed: ParsedInstruction, per
     next.motion_ctx.total_steps = steps.length;
 
     if (next.motion_ctx.step_idx < steps.length) {
-      const currentStep = steps[next.motion_ctx.step_idx];
-      next.motion_ctx.step_idx += 1;
-      notes.push(`motion step ${next.motion_ctx.step_idx}/${steps.length}`);
-      plan.push(currentStep);
+      const remaining = steps.slice(next.motion_ctx.step_idx);
+      next.motion_ctx.step_idx = steps.length;
+      notes.push(`motion macro emitted ${remaining.length} steps (${steps.length} total)`);
+      plan.push(...remaining);
       plan.push(stopStep());
       next.motion_ctx.consumed = next.motion_ctx.step_idx >= steps.length;
     } else {
