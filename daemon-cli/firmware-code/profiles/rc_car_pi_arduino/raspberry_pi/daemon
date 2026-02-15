@@ -166,6 +166,8 @@ def handle_build(_args: argparse.Namespace) -> int:
                 "base=vporto26.local:8766",
                 "--node",
                 "arm=vporto26.local:8767",
+                "--node",
+                "cam=vporto26.local:8768",
                 "--http-port",
                 "5055",
             ],

@@ -12,6 +12,8 @@ const RUNTIME_IS_TAURI = isTauri();
 
 const VERCEL_BASE_URL = import.meta.env.VITE_VERCEL_BASE_URL || DEFAULT_VERCEL_BASE_URL;
 const ORCH_BASE_URL = import.meta.env.VITE_ORCHESTRATOR_BASE_URL || DEFAULT_ORCH_BASE_URL;
+const REMOTE_CAMERA_SNAPSHOT_URL = import.meta.env.VITE_REMOTE_CAMERA_SNAPSHOT_URL || "";
+const REMOTE_CAMERA_MJPEG_URL = import.meta.env.VITE_REMOTE_CAMERA_MJPEG_URL || "";
 
 const INITIAL_STATE = {
   stage: "SEARCH",
@@ -75,6 +77,19 @@ async function captureFrameBase64(video, canvas) {
     return null;
   }
 
+  return blobToBase64(blob);
+}
+
+async function fetchSnapshotBase64(snapshotUrl) {
+  const url = String(snapshotUrl || "").trim();
+  if (!url) {
+    return null;
+  }
+  const resp = await fetch(`${url}${url.includes("?") ? "&" : "?"}ts=${Date.now()}`, { cache: "no-store" });
+  if (!resp.ok) {
+    throw new Error(`Camera snapshot fetch failed: HTTP ${resp.status}`);
+  }
+  const blob = await resp.blob();
   return blobToBase64(blob);
 }
 
@@ -264,6 +279,7 @@ async function orchestratorStop(orchestratorBaseUrl) {
 
 function App() {
   const videoRef = useRef(null);
+  const remoteImgRef = useRef(null);
   const captureCanvasRef = useRef(null);
   const overlayCanvasRef = useRef(null);
   const streamRef = useRef(null);
@@ -300,6 +316,10 @@ function App() {
   const [nodeProbeResults, setNodeProbeResults] = useState([]);
   const [hardwareBusy, setHardwareBusy] = useState(false);
   const [capabilities, setCapabilities] = useState(INITIAL_STATE.capabilities);
+  const [systemManifest, setSystemManifest] = useState(null);
+  const [cameraMode, setCameraMode] = useState("auto"); // auto | local | remote
+  const [cameraSnapshotUrl, setCameraSnapshotUrl] = useState(REMOTE_CAMERA_SNAPSHOT_URL);
+  const [cameraMjpegUrl, setCameraMjpegUrl] = useState(REMOTE_CAMERA_MJPEG_URL);
   const [traceLog, setTraceLog] = useState([]);
   const [backendAuditLog, setBackendAuditLog] = useState("");
   const traceSeqRef = useRef(0);
@@ -409,15 +429,28 @@ function App() {
       // The desktop app can still talk to an external orchestrator if the user starts it manually.
       const shouldReportOrchError = Boolean(orchestratorProc?.running) || orchestratorBaseUrl.trim() !== ORCH_BASE_URL.trim();
       try {
-        await orchestratorStatus(orchestratorBaseUrl);
+        const status = await orchestratorStatus(orchestratorBaseUrl);
         if (!cancelled) {
           setOrchestratorReachable(true);
           setLastOrchestratorError("");
+          setSystemManifest(status?.system_manifest || null);
+
+          // Auto-discover camera services from the orchestrator manifest if present.
+          if (cameraMode === "auto" && !REMOTE_CAMERA_SNAPSHOT_URL && !REMOTE_CAMERA_MJPEG_URL) {
+            const nodes = Array.isArray(status?.system_manifest?.nodes) ? status.system_manifest.nodes : [];
+            const camNode = nodes.find((n) => n?.services?.camera);
+            const svc = camNode?.services?.camera || null;
+            const snap = String(svc?.snapshot_url || "").trim();
+            const mjpeg = String(svc?.mjpeg_url || "").trim();
+            if (snap && !cameraSnapshotUrl) setCameraSnapshotUrl(snap);
+            if (mjpeg && !cameraMjpegUrl) setCameraMjpegUrl(mjpeg);
+          }
         }
       } catch (error) {
         if (!cancelled) {
           setOrchestratorReachable(false);
           setLastOrchestratorError(shouldReportOrchError ? String(error) : "");
+          setSystemManifest(null);
         }
       }
 
@@ -437,7 +470,7 @@ function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [orchestratorBaseUrl]);
+  }, [orchestratorBaseUrl, cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
 
   const parseNodeEndpoints = () => {
     return nodeEndpoints
@@ -567,7 +600,18 @@ function App() {
     streamRef.current = null;
   };
 
+  const effectiveCameraMode = useMemo(() => {
+    if (cameraMode === "local") return "local";
+    if (cameraMode === "remote") return "remote";
+    // auto: prefer remote if we have a snapshot URL or MJPEG URL.
+    if (String(cameraSnapshotUrl || "").trim() || String(cameraMjpegUrl || "").trim()) return "remote";
+    return "local";
+  }, [cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
+
   const ensureCamera = async () => {
+    if (effectiveCameraMode === "remote") {
+      return;
+    }
     if (streamRef.current && videoRef.current?.srcObject) {
       return;
     }
@@ -612,7 +656,9 @@ function App() {
     setSendingFrames(false);
     setLiveEnabled(false);
     liveEnabledRef.current = false;
-    releaseCamera();
+    if (effectiveCameraMode === "local") {
+      releaseCamera();
+    }
 
     if (!sendStop) {
       return;
@@ -708,7 +754,10 @@ function App() {
 
     try {
       await ensureCamera();
-      const frame_jpeg_base64 = await captureFrameBase64(videoRef.current, captureCanvasRef.current);
+      const frame_jpeg_base64 =
+        effectiveCameraMode === "remote"
+          ? await fetchSnapshotBase64(cameraSnapshotUrl)
+          : await captureFrameBase64(videoRef.current, captureCanvasRef.current);
       if (!frame_jpeg_base64) {
         throw new Error("camera frame unavailable");
       }
@@ -719,6 +768,7 @@ function App() {
         frame_jpeg_base64,
         instruction: instructionToSend,
         correlation_id: correlationId,
+        system_manifest: systemManifest,
         state: stateRef.current
       };
       appendTrace("vision.step.request", {
@@ -895,6 +945,29 @@ function App() {
           <button className="ghost" onClick={stopOrchestratorProcess} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Stop</button>
         </div>
         <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>camera:</span>
+          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)}>
+            <option value="auto">auto</option>
+            <option value="local">local webcam</option>
+            <option value="remote">robot camera</option>
+          </select>
+          <span>snapshot_url</span>
+          <input
+            value={cameraSnapshotUrl}
+            onChange={(event) => setCameraSnapshotUrl(event.target.value)}
+            placeholder="http://vporto26.local:8081/snapshot.jpg"
+            style={{ width: 360 }}
+          />
+          <span>mjpeg_url</span>
+          <input
+            value={cameraMjpegUrl}
+            onChange={(event) => setCameraMjpegUrl(event.target.value)}
+            placeholder="http://vporto26.local:8081/stream.mjpg"
+            style={{ width: 320 }}
+          />
+          <span>mode={effectiveCameraMode}</span>
+        </div>
+        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <span>caps:</span>
           <span>base_target</span>
           <input
@@ -1006,7 +1079,16 @@ function App() {
         <section className="panel video-panel">
           <h2>Live Camera</h2>
           <div className="video-shell">
-            <video ref={videoRef} autoPlay muted playsInline className="video" />
+            {effectiveCameraMode === "remote" ? (
+              <img
+                ref={remoteImgRef}
+                className="video"
+                alt="robot camera"
+                src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
+              />
+            ) : (
+              <video ref={videoRef} autoPlay muted playsInline className="video" />
+            )}
             <canvas ref={overlayCanvasRef} className="overlay" />
           </div>
           <canvas ref={captureCanvasRef} className="hidden-canvas" />

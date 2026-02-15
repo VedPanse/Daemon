@@ -36,7 +36,7 @@ If `.local` is flaky, use the Pi IPv4 (on the Pi run `hostname -I`).
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git python3 python3-serial
+sudo apt-get install -y git python3 python3-serial fswebcam
 ```
 
 ## 2) Clone The Repo On The Pi
@@ -141,6 +141,33 @@ s.close()
 PY
 ```
 
+## 4c) Camera Node (USB webcam + fswebcam)
+
+This runs:
+- DAEMON node protocol on TCP `8768` (so the orchestrator manifest knows a camera exists)
+- HTTP snapshot/MJPEG on `8081` (so the desktop app can use the robot camera frames)
+
+Verify the camera device exists:
+```bash
+ls -l /dev/video* 2>/dev/null || true
+v4l2-ctl --list-devices 2>/dev/null || true
+```
+
+Start camera node:
+```bash
+pkill -f usb_camera_daemon_node.py || true
+nohup python3 daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/usb_camera_daemon_node.py \
+  --port 8768 --node-id cam --http-port 8081 --device /dev/video0 > ~/camera_node.log 2>&1 &
+ss -ltnp | egrep ':(8768|8081)\\b' || true
+tail -n 60 ~/camera_node.log
+```
+
+Quick HTTP check (from laptop):
+```bash
+curl -s -o /dev/null -w "%{http_code}\\n" http://vporto26.local:8081/health
+curl -s -o /tmp/daemon_snapshot.jpg http://vporto26.local:8081/snapshot.jpg && file /tmp/daemon_snapshot.jpg
+```
+
 ## 5) Healthcheck From Laptop
 
 From repo root on laptop (not on Pi):
@@ -162,6 +189,7 @@ Start orchestrator in HTTP bridge mode on your laptop:
 python3 orchestrator/orchestrator.py \
   --node base=vporto26.local:8766 \
   --node arm=vporto26.local:8767 \
+  --node cam=vporto26.local:8768 \
   --http-port 5055
 ```
 

@@ -19,6 +19,9 @@ For this profile, the Raspberry Pi runs a node server that:
 - keeps `/dev/ttyACM0` open (Arduino resets on open)
 - maps high-level tokens like `FWD` + `TURN` to the Arduino's single-letter mecanum commands
 - relies on the orchestrator for step timing (orchestrator sleeps `duration_ms` then sends `STOP`)
+- also exposes a camera node:
+  - DAEMON node protocol on `8768` (token `SNAP` for semantic visibility)
+  - HTTP snapshot/MJPEG on `8081` (used by the desktop app for robot-first vision)
 
 ### Start on the Pi
 

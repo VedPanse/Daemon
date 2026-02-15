@@ -268,12 +268,36 @@ class Orchestrator:
     def merged_manifest(self) -> dict[str, Any]:
         nodes: list[dict[str, Any]] = []
         for node in self.nodes:
+            services_in = node.manifest.get("services") if isinstance(node.manifest.get("services"), dict) else {}
+            services_out: dict[str, Any] = {}
+            if isinstance(services_in, dict):
+                for name, spec in services_in.items():
+                    if not isinstance(name, str) or not isinstance(spec, dict):
+                        continue
+                    merged = dict(spec)
+                    http_port = merged.get("http_port")
+                    if isinstance(http_port, int) and http_port > 0 and "base_url" not in merged:
+                        merged["base_url"] = f"http://{node.host}:{http_port}"
+                    base_url = merged.get("base_url")
+                    if isinstance(base_url, str) and base_url.startswith("http"):
+                        snap_path = merged.get("snapshot_path")
+                        mjpeg_path = merged.get("mjpeg_path")
+                        if isinstance(snap_path, str) and "snapshot_url" not in merged:
+                            merged["snapshot_url"] = base_url.rstrip("/") + (snap_path if snap_path.startswith("/") else f"/{snap_path}")
+                        if isinstance(mjpeg_path, str) and "mjpeg_url" not in merged:
+                            merged["mjpeg_url"] = base_url.rstrip("/") + (mjpeg_path if mjpeg_path.startswith("/") else f"/{mjpeg_path}")
+                    services_out[name] = merged
+
             nodes.append(
                 {
-                    "name": node.node_name or node.alias,
+                    # Use the CLI alias as the "name" so planners return targets like "base"/"arm"/"cam",
+                    # which the orchestrator can always resolve. Device names remain available as display_name.
+                    "name": node.alias,
                     "node_id": node.node_id or node.alias,
+                    "display_name": node.node_name or node.alias,
                     "commands": node.manifest.get("commands", []),
                     "telemetry": node.manifest.get("telemetry", {}),
+                    **({"services": services_out} if services_out else {}),
                 }
             )
 
@@ -715,6 +739,7 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
                         "port": node.port,
                         "connected": node.sock is not None and node.running,
                         "commands": [str(command.get("token", "")) for command in node.manifest.get("commands", [])],
+                        "services": node.manifest.get("services", {}) if isinstance(node.manifest.get("services"), dict) else {},
                     }
                 )
 
