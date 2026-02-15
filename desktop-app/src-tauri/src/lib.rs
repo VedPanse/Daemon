@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use serialport::SerialPort;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::{fs::OpenOptions};
@@ -116,6 +116,56 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
         return Err("base_url is empty".to_string());
     }
     Ok(trimmed.to_string())
+}
+
+fn normalize_local_host(raw: &str) -> Result<IpAddr, String> {
+    let trimmed = raw.trim();
+    let normalized = if trimmed.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1"
+    } else {
+        trimmed
+    };
+    normalized
+        .parse::<IpAddr>()
+        .map_err(|_| format!("http_host must be an IP address (e.g. 127.0.0.1), got: {trimmed}"))
+}
+
+fn pick_free_tcp_port(host: IpAddr, preferred: u16) -> Result<u16, String> {
+    let preferred_addr = SocketAddr::new(host, preferred);
+    if let Ok(listener) = TcpListener::bind(preferred_addr) {
+        drop(listener);
+        return Ok(preferred);
+    }
+
+    let listener = TcpListener::bind(SocketAddr::new(host, 0))
+        .map_err(|e| format!("Failed to bind ephemeral port on {host}: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read ephemeral port: {e}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn wait_for_tcp_listen(host: IpAddr, port: u16, child: &mut Child, timeout: Duration) -> Result<(), String> {
+    let addr = SocketAddr::new(host, port);
+    let start = std::time::Instant::now();
+
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("Orchestrator exited early with status {status}"));
+        }
+
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!("Timed out waiting for orchestrator to listen on {addr}"));
+        }
+
+        thread::sleep(Duration::from_millis(80));
+    }
 }
 
 fn resolve_socket_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
@@ -737,8 +787,10 @@ fn orchestrator_spawn(
         *lock = None;
     }
 
-    let http_port = http_port.unwrap_or(5055);
-    let http_host = http_host.unwrap_or_else(|| "127.0.0.1".to_string());
+    let http_host_raw = http_host.unwrap_or_else(|| "127.0.0.1".to_string());
+    let http_host_ip = normalize_local_host(&http_host_raw)?;
+    let preferred_port = http_port.unwrap_or(5055);
+    let http_port = pick_free_tcp_port(http_host_ip, preferred_port)?;
     let repo_root = find_repo_root()?;
     let orch_path = repo_root.join("orchestrator").join("orchestrator.py");
     if !orch_path.exists() {
@@ -771,7 +823,7 @@ fn orchestrator_spawn(
         args.push(format!("{step_timeout}"));
     }
     args.push("--http-host".to_string());
-    args.push(http_host.clone());
+    args.push(http_host_raw.trim().to_string());
     args.push("--http-port".to_string());
     args.push(http_port.to_string());
 
@@ -795,9 +847,11 @@ fn orchestrator_spawn(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
 
-    let child = cmd.spawn().map_err(|e| format!("Failed to spawn orchestrator: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn orchestrator: {e}"))?;
+    wait_for_tcp_listen(http_host_ip, http_port, &mut child, Duration::from_secs(3))
+        .map_err(|e| format!("{e}. If a previous orchestrator is running, stop it or use a different port."))?;
 
-    let http_base_url = format!("http://{}:{}", http_host, http_port);
+    let http_base_url = format!("http://{}:{}", http_host_raw.trim(), http_port);
     *lock = Some(OrchestratorProcess {
         child,
         args,
