@@ -1,4 +1,4 @@
-export type TaskType = "stop" | "move-pattern" | "pick-object" | "follow" | "search" | "avoid+approach" | "unknown";
+export type TaskType = "stop" | "move-pattern" | "arm-control" | "pick-object" | "follow" | "search" | "avoid+approach" | "unknown";
 
 export type MotionPattern = "circle" | "square" | "triangle";
 
@@ -22,6 +22,7 @@ export interface ParsedInstruction {
   target: TargetSpec;
   pattern?: MotionPattern;
   canonical_actions?: CanonicalAction[];
+  arm_actions?: Array<{ state: "open" | "hold"; duration_s?: number }>;
   count?: number;
   distance_m?: number;
 }
@@ -109,6 +110,12 @@ function parseDistanceMeters(text: string): number | undefined {
     return undefined;
   }
   return clamp(Number(match[1]), 0.1, 10);
+}
+
+function parseDurationSeconds(text: string): number | undefined {
+  const match = text.match(/\b(\d+(?:\.\d+)?)\s*(second|seconds|sec|s)\b/);
+  if (!match) return undefined;
+  return clamp(Number(match[1]), 0.1, 60);
 }
 
 function cleanTargetPhrase(value: string | null): string | null {
@@ -214,6 +221,32 @@ export function parseInstruction(instruction: string): ParsedInstruction {
       target,
       canonical_actions: [{ type: "STOP" }]
     };
+  }
+
+  if (/\b(claw|gripper)\b/.test(text) && /\b(open|close|hold)\b/.test(text)) {
+    const duration = parseDurationSeconds(text);
+    const actions: Array<{ idx: number; state: "open" | "hold" }> = [];
+    const openIdx = text.indexOf("open");
+    const closeIdx = text.indexOf("close");
+    const holdIdx = text.indexOf("hold");
+    if (openIdx >= 0) actions.push({ idx: openIdx, state: "open" });
+    if (closeIdx >= 0) actions.push({ idx: closeIdx, state: "hold" });
+    if (holdIdx >= 0) actions.push({ idx: holdIdx, state: "hold" });
+    actions.sort((a, b) => a.idx - b.idx);
+
+    const arm_actions = actions.map((action, index) =>
+      index === 0 && duration !== undefined
+        ? { state: action.state, duration_s: duration }
+        : { state: action.state }
+    );
+
+    if (arm_actions.length > 0) {
+      return {
+        task_type: "arm-control",
+        arm_actions,
+        target
+      };
+    }
   }
 
   if (/circle|square|triangle/.test(text)) {
@@ -327,7 +360,7 @@ function bboxCenterDistance(
 }
 
 export function shouldBypassPerceptionTask(taskType: TaskType): boolean {
-  return taskType === "stop" || taskType === "move-pattern";
+  return taskType === "stop" || taskType === "move-pattern" || taskType === "arm-control";
 }
 
 export function selectTargetDeterministic(

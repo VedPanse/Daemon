@@ -215,6 +215,15 @@ run("manifest-aware canonical MOVE left maps to STRAFE", async () => {
   assert.equal(out?.debug?.manifest_guard?.dropped_steps, 0);
 });
 
+run("arm-control instruction emits GRIP open then hold", async () => {
+  const out = await postVision(makeFrameBase64(), "open the claw for 5 seconds then close it", {});
+  const runs = (Array.isArray(out.plan) ? out.plan : []).filter((step: any) => step?.type === "RUN");
+  assert.equal(runs.length >= 1, true);
+  assert.equal(runs[0]?.token, "GRIP");
+  assert.equal(runs[0]?.args?.[0], "open");
+  assert.equal(runs[0]?.duration_ms, 5000);
+});
+
 async function main() {
   for (const test of tests) {
     try {

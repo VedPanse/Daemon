@@ -1,11 +1,11 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use serialport::SerialPort;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::{fs::OpenOptions};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -159,7 +159,11 @@ fn find_repo_root() -> Result<PathBuf, String> {
 
 fn resolve_python3() -> String {
     // GUI apps on macOS might not inherit the interactive shell PATH.
-    for candidate in ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"] {
+    for candidate in [
+        "/usr/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ] {
         if Path::new(candidate).exists() {
             return candidate.to_string();
         }
@@ -195,11 +199,7 @@ fn append_desktop_audit_log(event: &str, payload: &Value) {
         return;
     }
     let log_path = logs_dir.join("backend_audit.jsonl");
-    let mut file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -231,8 +231,12 @@ fn sanitize_log_file_name(file_name: &str) -> Result<String, String> {
 fn write_debug_log(file_name: String, payload: Value) -> Result<(), String> {
     let safe_name = sanitize_log_file_name(&file_name)?;
     let logs_dir = repo_logs_dir()?;
-    std::fs::create_dir_all(&logs_dir)
-        .map_err(|e| format!("Failed to create logs directory {}: {e}", logs_dir.display()))?;
+    std::fs::create_dir_all(&logs_dir).map_err(|e| {
+        format!(
+            "Failed to create logs directory {}: {e}",
+            logs_dir.display()
+        )
+    })?;
     let path = logs_dir.join(safe_name);
     let mut file = OpenOptions::new()
         .create(true)
@@ -243,8 +247,7 @@ fn write_debug_log(file_name: String, payload: Value) -> Result<(), String> {
         "ts_ms": unix_ts_ms(),
         "payload": payload
     });
-    writeln!(file, "{}", line)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    writeln!(file, "{}", line).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -377,7 +380,8 @@ async fn orchestrator_request(
             &json!({
                 "method": method.to_string(),
                 "url": url.clone(),
-                "error": msg
+                "error": msg,
+                "correlation_id": correlation_id
             }),
         );
         msg
@@ -395,7 +399,8 @@ async fn orchestrator_request(
             "method": method.to_string(),
             "url": url.clone(),
             "status": status.as_u16(),
-            "body": trunc_for_log(&response_text, 8000)
+            "body": trunc_for_log(&response_text, 8000),
+            "correlation_id": correlation_id
         }),
     );
 
@@ -409,6 +414,71 @@ async fn orchestrator_request(
 
     serde_json::from_str::<Value>(&response_text).map_err(|error| {
         format!("{method} {url} failed: invalid JSON response: {error}; body={response_text}")
+    })
+}
+
+#[tauri::command]
+async fn vision_step_request(
+    vercel_base_url: String,
+    payload: Value,
+    correlation_id: Option<String>,
+) -> Result<Value, String> {
+    let base = normalize_base_url(&vercel_base_url)?;
+    let url = format!("{base}/api/vision_step");
+    let client = reqwest::Client::new();
+    let request = client.post(&url).json(&payload);
+    let request = if let Some(cid) = correlation_id.as_ref() {
+        request.header("X-Correlation-Id", cid)
+    } else {
+        request
+    };
+
+    append_desktop_audit_log(
+        "vision_step.request",
+        &json!({
+            "url": url,
+            "correlation_id": correlation_id
+        }),
+    );
+
+    let response = request.send().await.map_err(|error| {
+        let msg = format!("POST {url} failed: network error: {error}");
+        append_desktop_audit_log(
+            "vision_step.network_error",
+            &json!({
+                "url": url,
+                "error": msg,
+                "correlation_id": correlation_id
+            }),
+        );
+        msg
+    })?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|error| format!("POST {url} failed: could not read response body: {error}"))?;
+
+    append_desktop_audit_log(
+        "vision_step.response",
+        &json!({
+            "url": url,
+            "status": status.as_u16(),
+            "body": trunc_for_log(&response_text, 8000),
+            "correlation_id": correlation_id
+        }),
+    );
+
+    if !status.is_success() {
+        return Err(format!(
+            "POST {url} failed: HTTP {} body={}",
+            status.as_u16(),
+            response_text
+        ));
+    }
+
+    serde_json::from_str::<Value>(&response_text).map_err(|error| {
+        format!("POST {url} failed: invalid JSON response: {error}; body={response_text}")
     })
 }
 
@@ -493,7 +563,10 @@ fn connect_serial(
     });
 
     {
-        let mut lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+        let mut lock = state
+            .session
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
         stop_session_locked(&mut lock);
         *lock = Some(SerialSession {
             writer,
@@ -510,7 +583,10 @@ fn connect_serial(
 
 #[tauri::command]
 fn disconnect_serial(state: State<'_, AppState>) -> Result<ConnectionStatus, String> {
-    let mut lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    let mut lock = state
+        .session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
     stop_session_locked(&mut lock);
 
     Ok(ConnectionStatus {
@@ -521,7 +597,10 @@ fn disconnect_serial(state: State<'_, AppState>) -> Result<ConnectionStatus, Str
 
 #[tauri::command]
 fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionStatus, String> {
-    let lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    let lock = state
+        .session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
     if let Some(session) = &*lock {
         Ok(ConnectionStatus {
             connected: true,
@@ -537,7 +616,10 @@ fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionStatus,
 
 #[tauri::command]
 fn send_serial_line(state: State<'_, AppState>, line: String) -> Result<(), String> {
-    let lock = state.session.lock().map_err(|_| "State lock poisoned".to_string())?;
+    let lock = state
+        .session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
     let Some(session) = &*lock else {
         return Err("No active serial connection".to_string());
     };
@@ -559,7 +641,14 @@ fn send_serial_line(state: State<'_, AppState>, line: String) -> Result<(), Stri
 
 #[tauri::command]
 async fn orchestrator_status(orchestrator_base_url: String) -> Result<Value, String> {
-    orchestrator_request(reqwest::Method::GET, orchestrator_base_url, "/status", None, None).await
+    orchestrator_request(
+        reqwest::Method::GET,
+        orchestrator_base_url,
+        "/status",
+        None,
+        None,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -633,7 +722,12 @@ fn orchestrator_spawn(
 
     // If already running, return status.
     if let Some(proc_) = &mut *lock {
-        if proc_.child.try_wait().map_err(|e| format!("Failed to query orchestrator process: {e}"))?.is_none() {
+        if proc_
+            .child
+            .try_wait()
+            .map_err(|e| format!("Failed to query orchestrator process: {e}"))?
+            .is_none()
+        {
             return Ok(OrchestratorProcessStatus {
                 running: true,
                 pid: Some(proc_.child.id()),
@@ -657,7 +751,9 @@ fn orchestrator_spawn(
     }
 
     if nodes.is_empty() {
-        return Err("nodes must contain at least one entry like base=vporto26.local:8765".to_string());
+        return Err(
+            "nodes must contain at least one entry like base=vporto26.local:8765".to_string(),
+        );
     }
 
     let mut args: Vec<String> = Vec::new();
@@ -670,7 +766,11 @@ fn orchestrator_spawn(
         args.push("--node".to_string());
         args.push(trimmed.to_string());
     }
-    if let Some(url) = planner_url.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(url) = planner_url
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         args.push("--planner-url".to_string());
         args.push(url);
     }
@@ -692,7 +792,12 @@ fn orchestrator_spawn(
         .create(true)
         .append(true)
         .open(&log_path)
-        .map_err(|e| format!("Failed to open orchestrator log file {}: {e}", log_path.display()))?;
+        .map_err(|e| {
+            format!(
+                "Failed to open orchestrator log file {}: {e}",
+                log_path.display()
+            )
+        })?;
     let log_file_err = log_file
         .try_clone()
         .map_err(|e| format!("Failed to clone log file handle: {e}"))?;
@@ -703,7 +808,9 @@ fn orchestrator_spawn(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
 
-    let child = cmd.spawn().map_err(|e| format!("Failed to spawn orchestrator: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn orchestrator: {e}"))?;
 
     let http_base_url = format!("http://{}:{}", http_host, http_port);
     *lock = Some(OrchestratorProcess {
@@ -721,7 +828,9 @@ fn orchestrator_spawn(
 }
 
 #[tauri::command]
-fn orchestrator_stop_process(state: State<'_, AppState>) -> Result<OrchestratorProcessStatus, String> {
+fn orchestrator_stop_process(
+    state: State<'_, AppState>,
+) -> Result<OrchestratorProcessStatus, String> {
     let mut lock = state
         .orchestrator_proc
         .lock()
@@ -736,7 +845,9 @@ fn orchestrator_stop_process(state: State<'_, AppState>) -> Result<OrchestratorP
 }
 
 #[tauri::command]
-fn orchestrator_process_status(state: State<'_, AppState>) -> Result<OrchestratorProcessStatus, String> {
+fn orchestrator_process_status(
+    state: State<'_, AppState>,
+) -> Result<OrchestratorProcessStatus, String> {
     let mut lock = state
         .orchestrator_proc
         .lock()
@@ -784,6 +895,7 @@ pub fn run() {
             orchestrator_status,
             orchestrator_execute_plan,
             orchestrator_stop,
+            vision_step_request,
             node_probe,
             write_debug_log,
             read_debug_log,
