@@ -32,7 +32,7 @@ function corsHeaders(origin: string | null): HeadersInit {
 }
 
 type Stage = "SEARCH" | "ALIGN" | "APPROACH" | "GRAB" | "DONE" | "MOTION_ONLY";
-type TaskType = "stop" | "move-pattern" | "arm-control" | "pick-object" | "follow" | "search" | "avoid+approach" | "unknown";
+type TaskType = "stop" | "move-pattern" | "pick-object" | "follow" | "search" | "avoid+approach" | "unknown";
 
 type MotionPattern = "circle" | "square" | "triangle";
 type CanonicalMoveDirection = "forward" | "backward" | "left" | "right";
@@ -54,7 +54,6 @@ interface ParsedInstruction {
   target: TargetSpec;
   pattern?: MotionPattern;
   canonical_actions?: CanonicalAction[];
-  arm_actions?: Array<{ state: "open" | "hold"; duration_s?: number }>;
   count?: number;
   distance_m?: number;
 }
@@ -1535,27 +1534,6 @@ function buildPlanAndState(
       plan.push(stopStep());
     }
 
-    return { state: next, plan, policyBranch, notes };
-  }
-
-  if (parsed.task_type === "arm-control") {
-    next.stage = "DONE";
-    policyBranch = "ARM/CONTROL";
-    const armTokens = uppercaseTokenSet(allowedTokenMap, caps.arm_target);
-    const canGrip = !allowedTokenMap || armTokens.has(caps.arm_grip_token.toUpperCase());
-    if (!canGrip) {
-      notes.push("arm-control requested but arm GRIP token is unavailable; fail-closed STOP");
-      plan.push(stopStep());
-      return { state: next, plan, policyBranch, notes };
-    }
-
-    const actions = parsed.arm_actions && parsed.arm_actions.length > 0 ? parsed.arm_actions : [{ state: "hold" as const }];
-    for (const action of actions) {
-      const durationMs = typeof action.duration_s === "number" ? clamp(Math.round(action.duration_s * 1000), 0, 60_000) : undefined;
-      plan.push(runStep(caps.arm_target, caps.arm_grip_token, [action.state], durationMs));
-    }
-    plan.push(stopStep());
-    notes.push(`arm-control emitted ${actions.length} grip action(s)`);
     return { state: next, plan, policyBranch, notes };
   }
 
