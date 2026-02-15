@@ -336,6 +336,7 @@ function App() {
   const [taskPrompt, setTaskPrompt] = useState(readPromptWithMigration("daemon.taskPrompt") || DEFAULT_PROMPT);
   const [draftPrompt, setDraftPrompt] = useState(readPromptWithMigration("daemon.draftPrompt") || DEFAULT_PROMPT);
   const [captureIntervalMs, setCaptureIntervalMs] = useState(DEFAULT_CAPTURE_INTERVAL_MS);
+  const [debugMode, setDebugMode] = useState(readLocalStorage("daemon.debugMode") === "1");
   const [liveEnabled, setLiveEnabled] = useState(false);
   const [sendingFrames, setSendingFrames] = useState(false);
   const [dryRun, setDryRun] = useState(false);
@@ -356,6 +357,7 @@ function App() {
   const [criticSuccessN, setCriticSuccessN] = useState(2);
   const [criticConfTh, setCriticConfTh] = useState(0.4);
   const [criticRewardTh, setCriticRewardTh] = useState(0.1);
+  const [rlIterations, setRlIterations] = useState([]);
 
   const [fsmState, setFsmState] = useState(INITIAL_STATE);
   const [perception, setPerception] = useState(null);
@@ -499,10 +501,11 @@ function App() {
       globalThis?.localStorage?.setItem("daemon.orchestratorBaseUrl", String(orchestratorBaseUrl || ""));
       globalThis?.localStorage?.setItem("daemon.taskPrompt", String(taskPrompt || ""));
       globalThis?.localStorage?.setItem("daemon.draftPrompt", String(draftPrompt || ""));
+      globalThis?.localStorage?.setItem("daemon.debugMode", debugMode ? "1" : "0");
     } catch {
       // ignore
     }
-  }, [visionMode, orchestratorBaseUrl, taskPrompt, draftPrompt]);
+  }, [visionMode, orchestratorBaseUrl, taskPrompt, draftPrompt, debugMode]);
 
   useEffect(() => {
     refreshBackendAuditLog();
@@ -1155,6 +1158,7 @@ function App() {
     setCriticResult(null);
     setCriticDoneText("");
     criticQualStreakRef.current = 0;
+    setRlIterations([]);
     setCriticEnabled(true);
     criticEnabledRef.current = true;
 
@@ -1289,6 +1293,33 @@ function App() {
           motionGate: Boolean(result?.motionGate)
         });
 
+        // Record iteration outcome for the streamlined UI.
+        setRlIterations((prev) => {
+          const nextIdx = prev.length + 1;
+          const failureModes = Array.isArray(result?.failureModes) ? result.failureModes : [];
+          const qualifies =
+            Number(result?.successConfidence || 0) >= Number(criticConfTh) &&
+            Number(result?.reward || 0) >= Number(criticRewardTh) &&
+            !Boolean(result?.motionGate) &&
+            !Boolean(result?.criticalFailure) &&
+            !failureModes.includes("uncertain") &&
+            !failureModes.includes("not_visible") &&
+            !failureModes.includes("target_not_visible");
+          const entry = {
+            i: nextIdx,
+            ts: new Date().toISOString(),
+            qualifies,
+            reward: Number(result?.reward || 0),
+            conf: Number(result?.successConfidence || 0),
+            success: Boolean(result?.success),
+            stable: Boolean(result?.successStable),
+            motionScore: Number(result?.motionScore || 0),
+            motionGate: Boolean(result?.motionGate),
+            failureModes
+          };
+          return [...prev, entry].slice(-100);
+        });
+
         const failureModes = Array.isArray(result?.failureModes) ? result.failureModes : [];
         const failClosed = failureModes.includes("uncertain") || failureModes.includes("not_visible") || failureModes.includes("target_not_visible");
         const qualifies =
@@ -1335,100 +1366,31 @@ function App() {
 
   return (
     <div className="studio">
-      <div className="hero">
+      <div className="hero" style={{ alignItems: "flex-end" }}>
         <div>
-          <p className="eyebrow">DAEMON Control Studio</p>
-          <h1>Natural-Language Robot Control</h1>
-          <p className="sub">Write the task in plain language. The app loops camera perception + plan execution in real time.</p>
+          <p className="eyebrow">DAEMON</p>
+          <h1>Reinforcement Learning (Physical Robot)</h1>
+          <p className="sub">Set a task, then press Start Reinforcement Learning. The system will iterate until the success condition is stable.</p>
         </div>
         <div className={orchestratorReachable ? "health ok" : "health bad"}>
           <span className="dot" />
-          <span>{orchestratorReachable ? "Orchestrator Online" : "Orchestrator Offline"}</span>
+          <span>{orchestratorReachable ? "Robot Connected" : "Robot Disconnected"}</span>
         </div>
       </div>
 
-      <section className="prompt-card">
-        <label>Hardware / Orchestrator</label>
-        <div className="prompt-row">
-          <textarea
-            value={nodeEndpoints}
-            onChange={(event) => setNodeEndpoints(event.target.value)}
-            rows={3}
-            style={{ flex: 1, minWidth: 320 }}
-            placeholder={"base=vporto26.local:8765\narm=127.0.0.1:7778"}
-          />
-          <button className="secondary" onClick={probeNodes} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Probe</button>
-          <button className="secondary" onClick={startOrchestrator} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>
-            Start Orchestrator
+      {!orchestratorReachable ? (
+        <section className="error" style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between" }}>
+          <div>
+            Robot connection lost. Reseat/tighten Ethernet (or USB), wait for link lights, then retry.
+          </div>
+          <button className="secondary" onClick={probeNodes} disabled={!RUNTIME_IS_TAURI || hardwareBusy}>
+            Retry
           </button>
-          <button className="ghost" onClick={stopOrchestratorProcess} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Stop</button>
-        </div>
-        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span>vision:</span>
-          <select value={visionMode} onChange={(event) => setVisionMode(event.target.value)}>
-            <option value="pi">pi brain (no laptop camera)</option>
-            <option value="cloud">cloud vision (uploads frames)</option>
-          </select>
-          <span>{visionMode === "pi" ? `pi=${PI_BRAIN_BASE_URL}` : `vercel=${VERCEL_BASE_URL}`}</span>
-        </div>
-        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span>camera:</span>
-          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)}>
-            <option value="auto">auto</option>
-            <option value="local">local webcam</option>
-            <option value="remote">robot camera</option>
-          </select>
-          <span>snapshot_url</span>
-          <input
-            value={cameraSnapshotUrl}
-            onChange={(event) => setCameraSnapshotUrl(event.target.value)}
-            placeholder="http://vporto26.local:8081/snapshot.jpg"
-            style={{ width: 360 }}
-          />
-          <span>mjpeg_url</span>
-          <input
-            value={cameraMjpegUrl}
-            onChange={(event) => setCameraMjpegUrl(event.target.value)}
-            placeholder="http://vporto26.local:8081/stream.mjpg"
-            style={{ width: 320 }}
-          />
-          <span>mode={effectiveCameraMode}</span>
-        </div>
-        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span>caps:</span>
-          <span>base_target</span>
-          <input
-            value={capabilities.base_target}
-            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_target: event.target.value }))}
-            style={{ width: 90 }}
-          />
-          <span>base_fwd_token</span>
-          <input
-            value={capabilities.base_fwd_token}
-            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_fwd_token: event.target.value }))}
-            style={{ width: 90 }}
-          />
-          <span>base_turn_token</span>
-          <input
-            value={capabilities.base_turn_token}
-            onChange={(event) => setCapabilities((prev) => ({ ...prev, base_turn_token: event.target.value }))}
-            style={{ width: 90 }}
-          />
-        </div>
-        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span>orchestrator:</span>
-          <input
-            value={orchestratorBaseUrl}
-            onChange={(event) => setOrchestratorBaseUrl(event.target.value)}
-            style={{ width: 320 }}
-          />
-          <span>{orchestratorProc?.running ? `pid=${orchestratorProc.pid}` : "not running (app can still talk to an external orchestrator)"}</span>
-        </div>
-        {nodeProbeResults.length ? <pre>{JSON.stringify(nodeProbeResults, null, 2)}</pre> : null}
-      </section>
+        </section>
+      ) : null}
 
       <section className="prompt-card">
-        <label htmlFor="taskPrompt">Task Prompt</label>
+        <label htmlFor="taskPrompt">Task</label>
         <div className="prompt-row">
           <input
             id="taskPrompt"
@@ -1440,188 +1402,129 @@ function App() {
                 void applyPrompt();
               }
             }}
-            placeholder="pick up the banana"
+            placeholder={DEFAULT_PROMPT}
           />
-          <button className="secondary" onClick={() => void applyPrompt()} disabled={!draftReady}>Send</button>
-          <button
-            className="ghost"
-            onClick={() => {
-              setDraftPrompt(DEFAULT_PROMPT);
-              setTaskPrompt(DEFAULT_PROMPT);
-            }}
-          >
+          <button className="secondary" onClick={() => void applyPrompt()} disabled={!draftReady}>
+            Set Task
+          </button>
+          <button className="ghost" onClick={() => { setDraftPrompt(DEFAULT_PROMPT); setTaskPrompt(DEFAULT_PROMPT); }}>
             Reset
           </button>
         </div>
-        <p className="note">{capabilityNote}</p>
       </section>
 
-      <section className="controls">
-        <button className={liveEnabled ? "primary active" : "primary"} onClick={handleLiveToggle} disabled={!promptReady}>
-          {liveEnabled ? "Stop Live Loop" : visionMode === "pi" ? "Enable Live Loop" : "Enable Live Camera"}
-        </button>
-        <button className="secondary" onClick={handleSingleStep} disabled={!promptReady}>Single Step</button>
-        <button className="panic" onClick={handleStop}>STOP</button>
-        <button
-          className={criticEnabled ? "secondary active" : "secondary"}
-          onClick={() => (criticEnabled ? void stopCriticLoop() : void startCriticLoop())}
-          disabled={!criticPromptReady || !RUNTIME_IS_TAURI}
-          title="Runs an OpenAI vision-language critic as a reward function and logs reward/success over time."
-        >
-          {criticEnabled ? "Stop Critic" : "Start Critic"}
-        </button>
+      <section className="controls" style={{ justifyContent: "space-between" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            className={criticEnabled ? "primary active" : "primary"}
+            onClick={() => (criticEnabled ? void stopCriticLoop() : void startCriticLoop())}
+            disabled={!criticPromptReady || !RUNTIME_IS_TAURI || !orchestratorReachable}
+            title="Runs the autonomy loop: execute -> watch -> judge -> repeat until stable success."
+          >
+            {criticEnabled ? "Stop Reinforcement Learning" : "Start Reinforcement Learning"}
+          </button>
+          <button className="panic" onClick={handleStop}>STOP</button>
+        </div>
         <label className="toggle">
-          <input type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
-          <span>Dry Run</span>
+          <input type="checkbox" checked={debugMode} onChange={(e) => setDebugMode(Boolean(e.target.checked))} />
+          <span>Debug Mode</span>
         </label>
       </section>
 
-      <section className="meta-grid">
-        <div><strong>Runtime:</strong> {RUNTIME_IS_TAURI ? "Tauri" : "Browser fallback"}</div>
-        <div><strong>Status:</strong> {statusText}</div>
-        <div><strong>Orchestrator:</strong> {orchestratorBaseUrl}</div>
-        <div><strong>FSM:</strong> {String(fsmState?.stage || "SEARCH")}</div>
-        <div><strong>Loop ms:</strong> {captureIntervalMs}</div>
-        <div><strong>FPS:</strong> {captureIntervalMs > 0 ? (1000 / captureIntervalMs).toFixed(1) : "-"}</div>
-        <div><strong>Verify:</strong> {String(lastDebug?.verification?.status || "unknown")}</div>
-        <div><strong>Last action:</strong> {lastActionText || "-"}</div>
-        <div><strong>At:</strong> {lastActionTimestamp || "-"}</div>
-        <div><strong>Vision:</strong> {visionMode === "pi" ? `pi ${PI_BRAIN_BASE_URL}` : `cloud ${VERCEL_BASE_URL}`}</div>
-        <div><strong>Applied instruction:</strong> {taskPrompt}</div>
-        <div><strong>Last sent instruction:</strong> {lastSentInstruction || "-"}</div>
-      </section>
-
-      {lastOrchestratorError ? <section className="error">Last orchestrator error: {lastOrchestratorError}</section> : null}
-      {errorText ? <section className="error">{errorText}</section> : null}
-
       <main className="grid">
         <section className="panel video-panel">
-          <h2>Live Camera</h2>
-          {visionMode === "pi" ? (
-            <div className="note">
-              Planner is in Pi mode (no frames are uploaded for planning). This preview is independent and is used by the Critic monitor.
-            </div>
-          ) : null}
+          <h2>Camera</h2>
           <div className="video-shell">
             {effectiveCameraMode === "remote" ? (
-              <img
-                ref={remoteImgRef}
-                className="video"
-                alt="robot camera"
-                src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
-              />
+              <img ref={remoteImgRef} className="video" alt="robot camera" src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()} />
             ) : (
               <video ref={videoRef} autoPlay muted playsInline className="video" />
             )}
             <canvas ref={overlayCanvasRef} className="overlay" />
           </div>
           <canvas ref={captureCanvasRef} className="hidden-canvas" />
-          <div className="metrics">
-            <span>found: {String(Boolean(perception?.found))}</span>
-            <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
-            <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
-            <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
-          </div>
         </section>
 
         <section className="panel">
-          <h2>Critic (Reward Function)</h2>
-          <div className="note">
-            Runs a vision-language critic on the current frame. Use this to see if behavior is correct, unsafe, or cheating.
-            Success is only stable after {criticSuccessN} consecutive high-confidence frames.
-          </div>
-          {criticError ? <div className="error">Critic: {criticError}</div> : null}
-          {criticDoneText ? <div className="note"><strong>{criticDoneText}</strong></div> : null}
-          <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-            <span>model</span>
-            <input value={criticModel} onChange={(e) => setCriticModel(e.target.value)} style={{ width: 140 }} />
-            <span>N</span>
-            <input value={criticSuccessN} onChange={(e) => setCriticSuccessN(Number(e.target.value || 0))} type="number" min="1" style={{ width: 70 }} />
-            <span>conf&gt;=</span>
-            <input value={criticConfTh} onChange={(e) => setCriticConfTh(Number(e.target.value || 0))} type="number" step="0.05" min="0" max="1" style={{ width: 80 }} />
-            <span>reward&gt;=</span>
-            <input value={criticRewardTh} onChange={(e) => setCriticRewardTh(Number(e.target.value || 0))} type="number" step="0.05" min="0" max="1" style={{ width: 80 }} />
-          </div>
-          <div className="metrics">
+          <h2>Reinforcement Learning</h2>
+          {criticError ? <div className="error">RL: {criticError}</div> : null}
+          {criticDoneText ? (
+            <div className="note" style={{ border: "1px solid rgba(134,239,172,0.45)", background: "rgba(134,239,172,0.08)", padding: 12, borderRadius: 12 }}>
+              <strong>{criticDoneText}</strong>
+            </div>
+          ) : null}
+          <div className="metrics" style={{ marginTop: 10 }}>
             <span>running: {String(Boolean(criticEnabled))}</span>
-            <span>reward: {Number(criticResult?.reward || 0).toFixed(3)}</span>
-            <span>success: {String(Boolean(criticResult?.success))}</span>
-            <span>conf: {Number(criticResult?.successConfidence || 0).toFixed(3)}</span>
-            <span>streak: {Number(criticResult?.successStreak || 0)}</span>
-            <span>stable: {String(Boolean(criticResult?.successStable))}</span>
-            <span>critical: {String(Boolean(criticResult?.criticalFailure))}</span>
-            <span>interrupt_sent: {String(Boolean(criticResult?.interruptSent))}</span>
+            <span>iterations: {rlIterations.length}</span>
+            <span>reward&gt;= {criticRewardTh}</span>
+            <span>conf&gt;= {criticConfTh}</span>
+            <span>N= {criticSuccessN}</span>
           </div>
-          <pre>{criticResult ? JSON.stringify(criticResult, null, 2) : "No critic results yet. Click Start Critic."}</pre>
-        </section>
 
-        <section className="panel">
-          <h2>Perception + State</h2>
-          <pre>{JSON.stringify({ state: fsmState, perception, debug: lastDebug }, null, 2)}</pre>
-        </section>
-
-        <section className="panel">
-          <h2>Last Plan</h2>
-          <pre>{JSON.stringify(lastPlan, null, 2)}</pre>
-        </section>
-
-        <section className="panel">
-          <h2>Learning + Verification Chart</h2>
-          <svg viewBox="0 0 600 220" width="100%" height="220" role="img" aria-label="learning chart">
-            <rect x="0" y="0" width="600" height="220" fill="#0d1117" />
-            {(() => {
-              if (!chartSeries.length) {
-                return <text x="20" y="30" fill="#9fb3c8" fontSize="14">No data yet</text>;
-              }
-              const mapPoints = (arr, valueFn, min, max) =>
-                arr
-                  .map((d, i) => {
-                    const x = (i / Math.max(1, arr.length - 1)) * 580 + 10;
-                    const v = valueFn(d);
-                    const y = 200 - ((Math.max(min, Math.min(max, v)) - min) / Math.max(1e-6, max - min)) * 170;
-                    return `${x},${y}`;
-                  })
-                  .join(" ");
-              const latencyMax = Math.max(200, ...chartSeries.map((d) => d.latency_ms));
-              const pVerify = mapPoints(chartSeries, (d) => d.verification_conf, 0, 1);
-              const pLatency = mapPoints(chartSeries, (d) => d.latency_ms, 0, latencyMax);
-              const pOnTrack = mapPoints(chartSeries, (d) => d.on_track_ratio, 0, 1);
-              return (
-                <>
-                  <polyline points={pVerify} fill="none" stroke="#7dd3fc" strokeWidth="2" />
-                  <polyline points={pOnTrack} fill="none" stroke="#86efac" strokeWidth="2" />
-                  <polyline points={pLatency} fill="none" stroke="#fca5a5" strokeWidth="2" />
-                  <text x="12" y="18" fill="#7dd3fc" fontSize="12">verification confidence</text>
-                  <text x="220" y="18" fill="#86efac" fontSize="12">on_track ratio</text>
-                  <text x="360" y="18" fill="#fca5a5" fontSize="12">latency ms</text>
-                </>
-              );
-            })()}
-          </svg>
-          <div className="metrics">
-            <span>false_switches: {Number(lastDebug?.learning?.false_switches || 0)}</span>
-            <span>recovery_count: {Number(lastDebug?.learning?.recovery_count || 0)}</span>
-            <span>avg_latency_ms: {Number(lastDebug?.learning?.avg_latency_ms || 0).toFixed(1)}</span>
-            <span>confidence_floor: {Number(lastDebug?.learning?.confidence_floor || 0).toFixed(3)}</span>
+          <div style={{ marginTop: 12 }}>
+            <div className="note">Iterations (latest first):</div>
+            <pre style={{ maxHeight: 320, overflow: "auto" }}>
+              {rlIterations.length
+                ? [...rlIterations]
+                    .slice()
+                    .reverse()
+                    .map((it) => {
+                      const tag = it.qualifies ? "SUCCESS" : "FAIL";
+                      return `iter ${it.i}: ${tag}  reward=${it.reward.toFixed(2)} conf=${it.conf.toFixed(2)} motion=${it.motionScore.toFixed(3)}${it.motionGate ? " gated" : ""}`;
+                    })
+                    .join("\n")
+                : "No iterations yet. Click Start Reinforcement Learning."}
+            </pre>
           </div>
+
+          {debugMode ? (
+            <>
+              <div className="note" style={{ marginTop: 12 }}>
+                Debug: critic raw JSON
+              </div>
+              <pre style={{ maxHeight: 260, overflow: "auto" }}>
+                {criticResult ? JSON.stringify(criticResult, null, 2) : "No critic results yet."}
+              </pre>
+            </>
+          ) : null}
         </section>
       </main>
 
-      <section className="panel">
-        <h2>Submit Trace</h2>
-        <div className="controls" style={{ justifyContent: "flex-start" }}>
-          <button className="secondary" onClick={() => setTraceLog([])}>Clear UI Trace</button>
-          <button className="secondary" onClick={refreshBackendAuditLog} disabled={!RUNTIME_IS_TAURI}>
-            Refresh Backend Audit
-          </button>
-        </div>
-        <pre>{traceLog.length ? traceLog.map((x) => JSON.stringify(x)).join("\n") : "No trace events yet."}</pre>
-      </section>
+      {debugMode ? (
+        <>
+          {lastOrchestratorError ? <section className="error">Last orchestrator error: {lastOrchestratorError}</section> : null}
+          {errorText ? <section className="error">{errorText}</section> : null}
 
-      <section className="panel">
-        <h2>Tauri Backend Audit Log</h2>
-        <pre>{backendAuditLog || "No backend audit lines yet."}</pre>
-      </section>
+          <section className="panel">
+            <h2>Debug: System</h2>
+            <div className="note" style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <span>orchestrator:</span>
+              <code>{orchestratorBaseUrl}</code>
+              <span>vision:</span>
+              <code>{visionMode}</code>
+              <span>camera:</span>
+              <code>{effectiveCameraMode}</code>
+            </div>
+            <pre>{JSON.stringify({ state: fsmState, perception, lastPlan, lastDebug }, null, 2)}</pre>
+          </section>
+
+          <section className="panel">
+            <h2>Debug: Trace</h2>
+            <div className="controls" style={{ justifyContent: "flex-start" }}>
+              <button className="secondary" onClick={() => setTraceLog([])}>Clear UI Trace</button>
+              <button className="secondary" onClick={refreshBackendAuditLog} disabled={!RUNTIME_IS_TAURI}>
+                Refresh Backend Audit
+              </button>
+            </div>
+            <pre style={{ maxHeight: 360, overflow: "auto" }}>{traceLog.length ? traceLog.map((x) => JSON.stringify(x)).join("\n") : "No trace events yet."}</pre>
+          </section>
+
+          <section className="panel">
+            <h2>Debug: Backend Audit</h2>
+            <pre style={{ maxHeight: 360, overflow: "auto" }}>{backendAuditLog || "No backend audit lines yet."}</pre>
+          </section>
+        </>
+      ) : null}
     </div>
   );
 }
