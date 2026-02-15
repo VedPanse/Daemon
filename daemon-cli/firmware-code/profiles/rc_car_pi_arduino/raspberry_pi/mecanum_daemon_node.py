@@ -73,7 +73,8 @@ DEFAULT_MANIFEST = {
         {
             "token": "TURN",
             "description": "Rotate in place. degrees<0 => left, degrees>0 => right (magnitude ignored by firmware).",
-            "args": [{"name": "degrees", "type": "int", "min": -180, "max": 180, "required": True}],
+            # Use float so upstream planners can send small corrective turns (e.g. 3.2 degrees).
+            "args": [{"name": "degrees", "type": "float", "min": -180.0, "max": 180.0, "required": True}],
             "safety": {"rate_limit_hz": 20, "watchdog_ms": 1200, "clamp": True},
             "nlp": {"synonyms": ["turn", "rotate", "spin"], "examples": ["turn 90", "turn -90"]},
         },
@@ -409,4 +410,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
