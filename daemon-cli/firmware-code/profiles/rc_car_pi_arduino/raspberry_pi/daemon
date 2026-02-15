@@ -19,10 +19,19 @@ LOG_DIR = SCRIPT_DIR / ".daemon_logs"
 def _find_repo_root(start: Path) -> Path:
     current = start
     while True:
-        if (current / "SETUP.md").exists() and (current / "desktop-app").exists():
+        # Older runbooks referenced SETUP.md, but some repo snapshots do not have it.
+        # Use a more robust set of monorepo markers.
+        if (
+            (current / "desktop-app").is_dir()
+            and (current / "daemon-cli").is_dir()
+            and (current / "orchestrator").is_dir()
+            and (current / "vercel-api").is_dir()
+        ):
             return current
         if current.parent == current:
-            raise RuntimeError("Could not find monorepo root containing SETUP.md and desktop-app")
+            raise RuntimeError(
+                "Could not find monorepo root containing desktop-app, daemon-cli, orchestrator, vercel-api"
+            )
         current = current.parent
 
 

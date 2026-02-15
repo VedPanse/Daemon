@@ -4,114 +4,55 @@ device:
   version: 0.1.0
   node_id: arduino
 commands:
-- token: FWD
-  description: Move forward
-  args:
-  - name: speed
-    type: float
-    min: 0.0
-    max: 1.0
-    required: true
-  safety:
-    rate_limit_hz: 20
-    watchdog_ms: 1200
-    clamp: true
-  nlp:
-    synonyms:
-    - fwd
-    - move forward
-    examples:
-    - Move forward
-- token: BWD
-  description: Move backward
-  args:
-  - name: speed
-    type: float
-    min: 0.0
-    max: 1.0
-    required: true
-  safety:
-    rate_limit_hz: 20
-    watchdog_ms: 1200
-    clamp: true
-  nlp:
-    synonyms:
-    - bwd
-    - move backward
-    examples:
-    - Move backward
-- token: STRAFE
-  description: Strafe left/right
-  args:
-  - name: dir
-    type: string
-    min: null
-    max: null
-    required: true
-  - name: speed
-    type: float
-    min: 0.0
-    max: 1.0
-    required: true
-  safety:
-    rate_limit_hz: 20
-    watchdog_ms: 1200
-    clamp: true
-  nlp:
-    synonyms:
-    - strafe
-    - strafe left/right
-    examples:
-    - Strafe left/right
-- token: TURN
-  description: Rotate in place by signed degrees
-  args:
-  - name: degrees
-    type: float
-    min: -180.0
-    max: 180.0
-    required: true
-  safety:
-    rate_limit_hz: 20
-    watchdog_ms: 1200
-    clamp: true
-  nlp:
-    synonyms:
-    - turn
-    - rotate in place by signed degrees
-    examples:
-    - Rotate in place by signed degrees
-- token: MECANUM
-  description: Direct primitive command (F,B,L,R,Q,E,S)
-  args:
-  - name: cmd
-    type: string
-    min: null
-    max: null
-    required: true
-  safety:
-    rate_limit_hz: 30
-    watchdog_ms: 1200
-    clamp: true
-  nlp:
-    synonyms:
-    - mecanum
-    - direct primitive command (f,b,l,r,q,e,s)
-    examples:
-    - Direct primitive command (F,B,L,R,Q,E,S)
-- token: STOP
-  description: Stop all motors
+- token: INIT
+  description: Initialize motor controller state
   args: []
   safety:
-    rate_limit_hz: 30
-    watchdog_ms: 1200
+    rate_limit_hz: 2
+    watchdog_ms: 2000
     clamp: true
   nlp:
     synonyms:
-    - stop
-    - stop all motors
+    - init
+    - initialize motor controller state
     examples:
-    - Stop all motors
+    - Initialize motor controller state
+- token: DRIVE
+  description: Set drive throttle/steering percent
+  args:
+  - name: throttle_percent
+    type: int
+    min: -100.0
+    max: 100.0
+    required: true
+  - name: steering_percent
+    type: int
+    min: -100.0
+    max: 100.0
+    required: true
+  safety:
+    rate_limit_hz: 20
+    watchdog_ms: 600
+    clamp: true
+  nlp:
+    synonyms:
+    - drive
+    - set drive throttle/steering percent
+    examples:
+    - Set drive throttle/steering percent
+- token: ESTOP
+  description: Emergency stop
+  args: []
+  safety:
+    rate_limit_hz: 10
+    watchdog_ms: 1000
+    clamp: true
+  nlp:
+    synonyms:
+    - estop
+    - emergency stop
+    examples:
+    - Emergency stop
 telemetry:
   keys:
   - name: uptime_ms
