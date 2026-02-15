@@ -217,6 +217,11 @@ class Orchestrator:
                 pass
 
     def _request(self, node: NodeInfo, line: str, timeout: float | None = None, correlation_id: str | None = None) -> str:
+        if node.sock is None or not node.running:
+            try:
+                self._reconnect_node(node)
+            except Exception as exc:
+                raise RuntimeError(f"{node.alias}: not connected ({exc})") from exc
         if node.sock is None:
             raise RuntimeError(f"{node.alias}: not connected")
 
