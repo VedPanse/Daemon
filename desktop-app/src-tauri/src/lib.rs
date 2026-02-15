@@ -719,13 +719,21 @@ async fn orchestrator_stop(orchestrator_base_url: String) -> Result<Value, Strin
 #[tauri::command]
 async fn vision_step(
     vision_base_url: String,
+    path: Option<String>,
     payload: Value,
     correlation_id: Option<String>,
 ) -> Result<Value, String> {
+    let path = path
+        .map(|raw| raw.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/api/vision_step".to_string());
+    if !path.starts_with('/') {
+        return Err(format!("vision_step path must start with '/', got: {path}"));
+    }
     vision_request(
         reqwest::Method::POST,
         vision_base_url,
-        "/api/vision_step",
+        &path,
         Some(payload),
         correlation_id,
     )

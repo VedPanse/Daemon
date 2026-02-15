@@ -1,12 +1,12 @@
 {
   "total_success": 0,
-  "total_failure": 10,
+  "total_failure": 11,
   "by_target": {
     "pick-object|box|blue": {
       "success": 0,
-      "failure": 10,
+      "failure": 11,
       "label_mismatch": 0,
-      "color_mismatch": 10
+      "color_mismatch": 11
     }
   }
 }

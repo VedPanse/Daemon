@@ -50,6 +50,23 @@ run("parseInstruction canonical MOVE strafe synonyms", () => {
   assert.equal((parsed.canonical_actions?.[0] as any)?.direction, "right");
 });
 
+run("parseInstruction multi-step move forward then move back", () => {
+  const parsed = parseInstruction("move forward then move back");
+  assert.equal(parsed.task_type, "move-pattern");
+  assert.equal(parsed.canonical_actions?.length, 2);
+  assert.equal(parsed.canonical_actions?.[0]?.type, "MOVE");
+  assert.equal((parsed.canonical_actions?.[0] as any)?.direction, "forward");
+  assert.equal(parsed.canonical_actions?.[1]?.type, "MOVE");
+  assert.equal((parsed.canonical_actions?.[1] as any)?.direction, "backward");
+});
+
+run("parseInstruction behind synonym maps to MOVE backward", () => {
+  const parsed = parseInstruction("go behind");
+  assert.equal(parsed.task_type, "move-pattern");
+  assert.equal(parsed.canonical_actions?.[0]?.type, "MOVE");
+  assert.equal((parsed.canonical_actions?.[0] as any)?.direction, "backward");
+});
+
 run("parseInstruction move-if-clear red object gate", () => {
   const parsed = parseInstruction("go forward if there is no red object ahead of it");
   assert.equal(parsed.task_type, "move-if-clear");

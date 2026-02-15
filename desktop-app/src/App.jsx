@@ -4,6 +4,7 @@ import "./App.css";
 
 const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
 const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
+const DEFAULT_PI_BRAIN_BASE_URL = "http://vporto26.local:8090";
 const FRAME_WIDTH = 320;
 const FRAME_HEIGHT = 240;
 const DEFAULT_CAPTURE_INTERVAL_MS = 180;
@@ -11,6 +12,7 @@ const STATUS_POLL_MS = 2000;
 const RUNTIME_IS_TAURI = isTauri();
 
 const VERCEL_BASE_URL = import.meta.env.VITE_VERCEL_BASE_URL || DEFAULT_VERCEL_BASE_URL;
+const PI_BRAIN_BASE_URL = import.meta.env.VITE_PI_BRAIN_BASE_URL || DEFAULT_PI_BRAIN_BASE_URL;
 const ORCH_BASE_URL = import.meta.env.VITE_ORCHESTRATOR_BASE_URL || DEFAULT_ORCH_BASE_URL;
 const REMOTE_CAMERA_SNAPSHOT_URL = import.meta.env.VITE_REMOTE_CAMERA_SNAPSHOT_URL || "";
 const REMOTE_CAMERA_MJPEG_URL = import.meta.env.VITE_REMOTE_CAMERA_MJPEG_URL || "";
@@ -93,9 +95,10 @@ async function fetchSnapshotBase64(snapshotUrl) {
   return blobToBase64(blob);
 }
 
-async function postVisionJson(url, body, correlationId) {
+async function postVisionJson(url, path, body, correlationId) {
   const base = String(url || "").replace(/\/+$/, "");
-  const endpoint = `${base}/api/vision_step`;
+  const normalizedPath = String(path || "").startsWith("/") ? String(path || "") : `/${String(path || "")}`;
+  const endpoint = `${base}${normalizedPath}`;
 
   // WKWebView networking (Tauri) can throw `TypeError: Load failed` even when the
   // endpoint is reachable. Proxy through Rust to make failures debuggable.
@@ -103,6 +106,7 @@ async function postVisionJson(url, body, correlationId) {
     try {
       return await invoke("vision_step", {
         visionBaseUrl: base,
+        path: normalizedPath,
         payload: body,
         correlationId
       });
@@ -296,6 +300,7 @@ function App() {
   const [liveEnabled, setLiveEnabled] = useState(false);
   const [sendingFrames, setSendingFrames] = useState(false);
   const [dryRun, setDryRun] = useState(false);
+  const [visionMode, setVisionMode] = useState(import.meta.env.VITE_VISION_MODE || "pi"); // pi | cloud
 
   const [fsmState, setFsmState] = useState(INITIAL_STATE);
   const [perception, setPerception] = useState(null);
@@ -602,14 +607,19 @@ function App() {
   };
 
   const effectiveCameraMode = useMemo(() => {
+    // In Pi-brain mode the laptop should not capture frames.
+    if (visionMode === "pi") return "none";
     if (cameraMode === "local") return "local";
     if (cameraMode === "remote") return "remote";
-    // auto: prefer remote if we have a snapshot URL or MJPEG URL.
-    if (String(cameraSnapshotUrl || "").trim() || String(cameraMjpegUrl || "").trim()) return "remote";
+    // auto: prefer remote only if we have a usable snapshot URL (MJPEG is for preview only).
+    if (String(cameraSnapshotUrl || "").trim()) return "remote";
     return "local";
-  }, [cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
+  }, [visionMode, cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
 
   const ensureCamera = async () => {
+    if (visionMode === "pi") {
+      return;
+    }
     if (effectiveCameraMode === "remote") {
       return;
     }
@@ -756,33 +766,57 @@ function App() {
 
     try {
       await ensureCamera();
-      const frame_jpeg_base64 =
-        effectiveCameraMode === "remote"
-          ? await fetchSnapshotBase64(cameraSnapshotUrl)
-          : await captureFrameBase64(videoRef.current, captureCanvasRef.current);
-      if (!frame_jpeg_base64) {
-        throw new Error("camera frame unavailable");
-      }
 
       const instructionToSend = appliedPromptRef.current.trim();
       const correlationId = makeCorrelationId();
+      const camera_meta =
+        visionMode === "pi"
+          ? { source: "pi_internal" }
+          : {
+              source: effectiveCameraMode,
+              ...(effectiveCameraMode === "remote"
+                ? {
+                    snapshot_url: String(cameraSnapshotUrl || "").trim() || null,
+                    mjpeg_url: String(cameraMjpegUrl || "").trim() || null
+                  }
+                : {})
+            };
       const visionPayload = {
-        frame_jpeg_base64,
         instruction: instructionToSend,
         correlation_id: correlationId,
         system_manifest: systemManifest,
+        camera_meta,
         state: stateRef.current
       };
+      if (visionMode !== "pi") {
+        const frame_jpeg_base64 = await (() => {
+          if (effectiveCameraMode !== "remote") {
+            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+          }
+          const snapUrl = String(cameraSnapshotUrl || "").trim();
+          if (!snapUrl) {
+            throw new Error("robot camera selected but snapshot_url is empty");
+          }
+          return fetchSnapshotBase64(snapUrl);
+        })();
+        if (!frame_jpeg_base64) {
+          throw new Error("camera frame unavailable");
+        }
+        visionPayload.frame_jpeg_base64 = frame_jpeg_base64;
+      }
       appendTrace("vision.step.request", {
         correlationId,
         executePlan,
         dryRun,
         instruction: instructionToSend,
+        camera_meta,
         stateStage: String(stateRef.current?.stage || "SEARCH")
       });
       setLastSentInstruction(instructionToSend);
 
-      const visionResponse = await postVisionJson(VERCEL_BASE_URL, visionPayload, correlationId);
+      const visionBaseUrl = visionMode === "pi" ? PI_BRAIN_BASE_URL : VERCEL_BASE_URL;
+      const visionPath = visionMode === "pi" ? "/vision_step" : "/api/vision_step";
+      const visionResponse = await postVisionJson(visionBaseUrl, visionPath, visionPayload, correlationId);
       const nextState = visionResponse?.state || stateRef.current;
       const nextPlan = Array.isArray(visionResponse?.plan) ? visionResponse.plan : [];
       const planCorrelationId = String(visionResponse?.correlation_id || correlationId);
@@ -857,7 +891,11 @@ function App() {
       setLastOrchestratorError(msg);
       setLastActionText("STEP FAILED");
       setLastActionTimestamp(nowStamp());
-      appendTrace("vision.step.error", { error: msg, visionBaseUrl: VERCEL_BASE_URL });
+      appendTrace("vision.step.error", {
+        error: msg,
+        visionMode,
+        visionBaseUrl: visionMode === "pi" ? PI_BRAIN_BASE_URL : VERCEL_BASE_URL
+      });
 
       if (liveEnabled) {
         await stopLoop({ sendStop: true });
@@ -895,7 +933,7 @@ function App() {
       };
       await loop();
     } catch (error) {
-      setErrorText(`Camera start failed: ${String(error)}`);
+      setErrorText(`${visionMode === "pi" ? "Loop start failed" : "Camera start failed"}: ${String(error)}`);
       await stopLoop({ sendStop: false });
     }
   };
@@ -947,8 +985,16 @@ function App() {
           <button className="ghost" onClick={stopOrchestratorProcess} disabled={hardwareBusy || !RUNTIME_IS_TAURI}>Stop</button>
         </div>
         <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span>vision:</span>
+          <select value={visionMode} onChange={(event) => setVisionMode(event.target.value)}>
+            <option value="pi">pi brain (no laptop camera)</option>
+            <option value="cloud">cloud vision (uploads frames)</option>
+          </select>
+          <span>{visionMode === "pi" ? `pi=${PI_BRAIN_BASE_URL}` : `vercel=${VERCEL_BASE_URL}`}</span>
+        </div>
+        <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <span>camera:</span>
-          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)}>
+          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)} disabled={visionMode === "pi"}>
             <option value="auto">auto</option>
             <option value="local">local webcam</option>
             <option value="remote">robot camera</option>
@@ -959,6 +1005,7 @@ function App() {
             onChange={(event) => setCameraSnapshotUrl(event.target.value)}
             placeholder="http://vporto26.local:8081/snapshot.jpg"
             style={{ width: 360 }}
+            disabled={visionMode === "pi"}
           />
           <span>mjpeg_url</span>
           <input
@@ -966,6 +1013,7 @@ function App() {
             onChange={(event) => setCameraMjpegUrl(event.target.value)}
             placeholder="http://vporto26.local:8081/stream.mjpg"
             style={{ width: 320 }}
+            disabled={visionMode === "pi"}
           />
           <span>mode={effectiveCameraMode}</span>
         </div>
@@ -1033,7 +1081,7 @@ function App() {
 
       <section className="controls">
         <button className={liveEnabled ? "primary active" : "primary"} onClick={handleLiveToggle} disabled={!promptReady}>
-          {liveEnabled ? "Stop Live Loop" : "Enable Live Camera"}
+          {liveEnabled ? "Stop Live Loop" : visionMode === "pi" ? "Enable Live Loop" : "Enable Live Camera"}
         </button>
         <button className="secondary" onClick={handleSingleStep} disabled={!promptReady}>Single Step</button>
         <button className="panic" onClick={handleStop}>STOP</button>
@@ -1053,7 +1101,7 @@ function App() {
         <div><strong>Verify:</strong> {String(lastDebug?.verification?.status || "unknown")}</div>
         <div><strong>Last action:</strong> {lastActionText || "-"}</div>
         <div><strong>At:</strong> {lastActionTimestamp || "-"}</div>
-        <div><strong>Vision API:</strong> {VERCEL_BASE_URL}</div>
+        <div><strong>Vision:</strong> {visionMode === "pi" ? `pi ${PI_BRAIN_BASE_URL}` : `cloud ${VERCEL_BASE_URL}`}</div>
         <div><strong>Applied instruction:</strong> {taskPrompt}</div>
         <div><strong>Last sent instruction:</strong> {lastSentInstruction || "-"}</div>
       </section>
@@ -1078,29 +1126,44 @@ function App() {
       {errorText ? <section className="error">{errorText}</section> : null}
 
       <main className="grid">
-        <section className="panel video-panel">
-          <h2>Live Camera</h2>
-          <div className="video-shell">
-            {effectiveCameraMode === "remote" ? (
-              <img
-                ref={remoteImgRef}
-                className="video"
-                alt="robot camera"
-                src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
-              />
-            ) : (
-              <video ref={videoRef} autoPlay muted playsInline className="video" />
-            )}
-            <canvas ref={overlayCanvasRef} className="overlay" />
-          </div>
-          <canvas ref={captureCanvasRef} className="hidden-canvas" />
-          <div className="metrics">
-            <span>found: {String(Boolean(perception?.found))}</span>
-            <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
-            <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
-            <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
-          </div>
-        </section>
+        {visionMode === "pi" ? (
+          <section className="panel video-panel">
+            <h2>Camera</h2>
+            <div className="note">
+              Pi brain mode: the robot captures and uses the camera internally. No camera preview is shown on the laptop.
+            </div>
+            <div className="metrics">
+              <span>found: {String(Boolean(perception?.found))}</span>
+              <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
+              <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
+              <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
+            </div>
+          </section>
+        ) : (
+          <section className="panel video-panel">
+            <h2>Live Camera</h2>
+            <div className="video-shell">
+              {effectiveCameraMode === "remote" ? (
+                <img
+                  ref={remoteImgRef}
+                  className="video"
+                  alt="robot camera"
+                  src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
+                />
+              ) : (
+                <video ref={videoRef} autoPlay muted playsInline className="video" />
+              )}
+              <canvas ref={overlayCanvasRef} className="overlay" />
+            </div>
+            <canvas ref={captureCanvasRef} className="hidden-canvas" />
+            <div className="metrics">
+              <span>found: {String(Boolean(perception?.found))}</span>
+              <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
+              <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
+              <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
+            </div>
+          </section>
+        )}
 
         <section className="panel">
           <h2>Perception + State</h2>

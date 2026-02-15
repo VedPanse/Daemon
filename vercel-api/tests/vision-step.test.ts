@@ -255,6 +255,23 @@ run("manifest-aware canonical MOVE left maps to STRAFE", async () => {
   assert.equal(out?.debug?.manifest_guard?.dropped_steps, 0);
 });
 
+run("move-pattern: multi-step forward then back emits both RUN steps", async () => {
+  const manifest = {
+    nodes: [
+      {
+        name: "base",
+        commands: [{ token: "FWD" }, { token: "BWD" }, { token: "STOP" }]
+      }
+    ]
+  };
+  const out = await postVision(makeFrameBase64(), "move forward then move back", {}, { system_manifest: manifest });
+  assert.equal(out.debug?.parsed_instruction?.task_type, "move-pattern");
+  const runs = (Array.isArray(out.plan) ? out.plan : []).filter((step: any) => step?.type === "RUN");
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0]?.token, "FWD");
+  assert.equal(runs[1]?.token, "BWD");
+});
+
 async function main() {
   for (const test of tests) {
     try {

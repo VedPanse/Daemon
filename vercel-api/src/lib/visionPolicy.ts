@@ -255,12 +255,11 @@ export function parseInstruction(instruction: string): ParsedInstruction {
   }
 
   if (
-    /\b(?:move|go|drive|head|strafe|slide|shift)\s+(?:to\s+)?(?:the\s+)?(?:left|right|forward|backward|backwards|back)\b/.test(text) ||
+    /\b(?:move|go|drive|head|strafe|slide|shift)\s+(?:to\s+)?(?:the\s+)?(?:left|right|forward|backward|backwards|back|behind)\b/.test(text) ||
     /\b(?:reverse|back up)\b/.test(text) ||
     /\bturn\s+(?:to\s+)?(?:the\s+)?(?:left|right)\b/.test(text) ||
     /\brotate\s+(?:left|right|clockwise|counterclockwise)\b/.test(text)
   ) {
-    const distance = parseDistanceMeters(text) ?? 1;
     const speed = 0.55;
 
     // Conditional motion that depends on visual absence/presence of a colored obstacle.
@@ -269,6 +268,7 @@ export function parseInstruction(instruction: string): ParsedInstruction {
       /\bif\b/.test(text) && /\b(no|not|can't|cannot|dont|don't)\b/.test(text) && Boolean(target.color);
     const hasUntilVisionGate = /\buntil\b/.test(text) && Boolean(target.color);
     if ((hasNegatedVisionGate || hasUntilVisionGate) && /\b(?:forward|move forward|go forward|drive forward|ahead)\b/.test(text)) {
+      const distance = parseDistanceMeters(text) ?? 1;
       return {
         task_type: "move-if-clear",
         canonical_actions: [{ type: "MOVE", direction: "forward", distance_m: distance, speed }],
@@ -278,57 +278,78 @@ export function parseInstruction(instruction: string): ParsedInstruction {
       };
     }
 
-    if (/\bturn\s+(?:to\s+)?(?:the\s+)?left\b|\brotate\s+left\b|\bcounterclockwise\b/.test(text)) {
-      return {
-        task_type: "move-pattern",
-        canonical_actions: [{ type: "TURN", direction: "left", angle_deg: 90, speed }],
-        count: 1,
-        target
-      };
+    // Multi-step motion: split on sequencing words and build multiple canonical actions.
+    const baseClauses = (raw: string) =>
+      raw
+        .split(/\b(?:and\s+then|then|after\s+that|afterwards|next)\b|,|;/gi)
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+    let clauses = baseClauses(text);
+    // If the user uses plain "and" (no "then") but clearly mentions multiple directions,
+    // treat it as a sequence delimiter for motion-only instructions.
+    if (clauses.length <= 1) {
+      const dirMentions = (text.match(/\b(?:forward|backward|backwards|back|behind|left|right)\b/gi) || []).length;
+      if (dirMentions >= 2 && /\band\b/.test(text)) {
+        const andClauses = text
+          .split(/\band\b/gi)
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (andClauses.length > 1) {
+          clauses = andClauses;
+        }
+      }
     }
-    if (/\bturn\s+(?:to\s+)?(?:the\s+)?right\b|\brotate\s+right\b|\bclockwise\b/.test(text)) {
-      return {
-        task_type: "move-pattern",
-        canonical_actions: [{ type: "TURN", direction: "right", angle_deg: 90, speed }],
-        count: 1,
-        target
-      };
+
+    const actions: CanonicalAction[] = [];
+    const pickDistance = (clause: string) => parseDistanceMeters(clause) ?? parseDistanceMeters(text) ?? 1;
+
+    for (const clause of clauses.length ? clauses : [text]) {
+      if (/\bturn\s+(?:to\s+)?(?:the\s+)?left\b|\brotate\s+left\b|\bcounterclockwise\b/.test(clause)) {
+        actions.push({ type: "TURN", direction: "left", angle_deg: 90, speed });
+        continue;
+      }
+      if (/\bturn\s+(?:to\s+)?(?:the\s+)?right\b|\brotate\s+right\b|\bclockwise\b/.test(clause)) {
+        actions.push({ type: "TURN", direction: "right", angle_deg: 90, speed });
+        continue;
+      }
+      if (/\b(?:backward|backwards|back up|move back|go back|reverse|behind)\b/.test(clause)) {
+        const distance = pickDistance(clause);
+        actions.push({ type: "MOVE", direction: "backward", distance_m: distance, speed });
+        continue;
+      }
+      if (/\b(?:left|strafe left|slide left|go to your left)\b/.test(clause)) {
+        const distance = pickDistance(clause);
+        actions.push({ type: "MOVE", direction: "left", distance_m: distance, speed });
+        continue;
+      }
+      if (/\b(?:right|strafe right|slide right|go to your right)\b/.test(clause)) {
+        const distance = pickDistance(clause);
+        actions.push({ type: "MOVE", direction: "right", distance_m: distance, speed });
+        continue;
+      }
+      if (/\b(?:forward|move forward|go forward|drive forward|ahead|straight)\b/.test(clause)) {
+        const distance = pickDistance(clause);
+        actions.push({ type: "MOVE", direction: "forward", distance_m: distance, speed });
+        continue;
+      }
     }
-    if (/\b(?:left|strafe left|slide left|go to your left)\b/.test(text)) {
+
+    if (actions.length > 0) {
+      const firstMove = actions.find((a) => a.type === "MOVE") as { distance_m?: number } | undefined;
+      const distance_m = firstMove?.distance_m;
       return {
         task_type: "move-pattern",
-        canonical_actions: [{ type: "MOVE", direction: "left", distance_m: distance, speed }],
-        distance_m: distance,
-        count: 1,
-        target
-      };
-    }
-    if (/\b(?:right|strafe right|slide right|go to your right)\b/.test(text)) {
-      return {
-        task_type: "move-pattern",
-        canonical_actions: [{ type: "MOVE", direction: "right", distance_m: distance, speed }],
-        distance_m: distance,
-        count: 1,
-        target
-      };
-    }
-    if (/\b(?:backward|backwards|back up|move back|go back|reverse)\b/.test(text)) {
-      return {
-        task_type: "move-pattern",
-        canonical_actions: [{ type: "MOVE", direction: "backward", distance_m: distance, speed }],
-        distance_m: distance,
+        canonical_actions: actions,
+        ...(typeof distance_m === "number" ? { distance_m } : {}),
         count: 1,
         target
       };
     }
 
-    return {
-      task_type: "move-pattern",
-      canonical_actions: [{ type: "MOVE", direction: "forward", distance_m: distance, speed }],
-      distance_m: distance,
-      count: 1,
-      target
-    };
+    // Fallback: default to a forward step if we failed to parse a direction.
+    const distance = parseDistanceMeters(text) ?? 1;
+    return { task_type: "move-pattern", canonical_actions: [{ type: "MOVE", direction: "forward", distance_m: distance, speed }], distance_m: distance, count: 1, target };
   }
 
   if (/follow\s+/.test(text)) {

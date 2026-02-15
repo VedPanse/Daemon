@@ -166,6 +166,12 @@ interface SystemManifestInput {
   }>;
 }
 
+interface CameraMetaInput {
+  source?: unknown;
+  snapshot_url?: unknown;
+  mjpeg_url?: unknown;
+}
+
 interface OpenAIPerception {
   objects: PerceivedObject[];
   summary: string;
@@ -1990,6 +1996,7 @@ export async function POST(request: Request) {
     const instructionHash = fnv1aHash(normalizeInstruction(instruction));
     const parseMs = Date.now() - parseStart;
     const allowedTokenMap = buildAllowedTokenMap(body.system_manifest);
+    const cameraMetaIn = isObject((body as Record<string, unknown>).camera_meta) ? ((body as Record<string, unknown>).camera_meta as CameraMetaInput) : null;
     const allowedBaseTokens = allowedTokenMap?.get("base") ? Array.from(allowedTokenMap.get("base") || []) : [];
     logVisionTrace("vision_step.parse", correlationId, {
       instruction: instruction.trim(),
@@ -2001,6 +2008,9 @@ export async function POST(request: Request) {
 
     let state = normalizeState(body.state);
     const notes: string[] = [];
+    if (cameraMetaIn && typeof cameraMetaIn.source === "string" && cameraMetaIn.source.trim()) {
+      notes.push(`camera_source=${cameraMetaIn.source.trim()}`);
+    }
 
     if (state.instruction_ctx.hash !== instructionHash) {
       state = resetStateForInstruction(state, instructionHash);
@@ -2154,6 +2164,13 @@ export async function POST(request: Request) {
           policy_branch: recoveryBranch,
           parsed_instruction: parsed,
           perception_source: perceptionResult.source,
+          camera_meta: cameraMetaIn
+            ? {
+                source: typeof cameraMetaIn.source === "string" ? cameraMetaIn.source : null,
+                snapshot_url: typeof cameraMetaIn.snapshot_url === "string" ? cameraMetaIn.snapshot_url : null,
+                mjpeg_url: typeof cameraMetaIn.mjpeg_url === "string" ? cameraMetaIn.mjpeg_url : null
+              }
+            : null,
           target_scoring: {
             decision_reason: perceptionResult.target_scoring.decision_reason,
             target_required: perceptionResult.target_scoring.target_required,

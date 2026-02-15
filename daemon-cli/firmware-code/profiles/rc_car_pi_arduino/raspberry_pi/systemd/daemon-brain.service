@@ -1,0 +1,18 @@
+[Unit]
+Description=DAEMON RC Car Vision Brain (Pi-local perception + planning)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=treehacks
+WorkingDirectory=/home/treehacks/Daemon
+ExecStart=/usr/bin/python3 /home/treehacks/Daemon/daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/pi_vision_brain_server.py --port 8090 --snapshot-url http://127.0.0.1:8081/snapshot.jpg
+Restart=always
+RestartSec=1
+StandardOutput=append:/home/treehacks/brain_node.log
+StandardError=append:/home/treehacks/brain_node.log
+
+[Install]
+WantedBy=multi-user.target
+

@@ -54,7 +54,8 @@ class Orchestrator:
         self,
         nodes: list[NodeInfo],
         telemetry: bool = False,
-        timeout_s: float = 3.0,
+        # mDNS `.local` lookups and first HELLO can take several seconds on some networks.
+        timeout_s: float = 7.0,
         # Nodes (especially Pi->Arduino bridges) may briefly block while recovering USB/serial.
         # Keep this generous so a single slow RUN doesn't fail the whole plan.
         step_timeout_s: float = 4.0,
@@ -873,6 +874,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--telemetry", action="store_true", help="Subscribe to node telemetry and print it")
     parser.add_argument("--instruction", default=None, help="One-shot instruction (non-interactive)")
     parser.add_argument("--step-timeout", type=float, default=4.0, help="Per-step RUN/STOP response timeout (seconds)")
+    parser.add_argument("--timeout", type=float, default=7.0, help="Node connect/HELLO timeout (seconds)")
     parser.add_argument("--http-host", default="127.0.0.1", help="HTTP bridge bind host")
     parser.add_argument("--http-port", type=int, default=None, help="HTTP bridge bind port")
     return parser.parse_args()
@@ -884,7 +886,7 @@ def main() -> None:
     if args.http_port is not None and args.instruction:
         raise RuntimeError("Use either --instruction one-shot mode or --http-port bridge mode, not both.")
 
-    orchestrator = Orchestrator(nodes=nodes, telemetry=args.telemetry, step_timeout_s=args.step_timeout)
+    orchestrator = Orchestrator(nodes=nodes, telemetry=args.telemetry, timeout_s=args.timeout, step_timeout_s=args.step_timeout)
     try:
         orchestrator.connect_all()
         if args.http_port is not None:

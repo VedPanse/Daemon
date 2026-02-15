@@ -36,7 +36,7 @@ If `.local` is flaky, use the Pi IPv4 (on the Pi run `hostname -I`).
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git python3 python3-serial fswebcam
+sudo apt-get install -y git python3 python3-serial fswebcam python3-opencv python3-numpy python3-requests
 ```
 
 ## 2) Clone The Repo On The Pi
@@ -166,6 +166,28 @@ Quick HTTP check (from laptop):
 ```bash
 curl -s -o /dev/null -w "%{http_code}\\n" http://vporto26.local:8081/health
 curl -s -o /tmp/daemon_snapshot.jpg http://vporto26.local:8081/snapshot.jpg && file /tmp/daemon_snapshot.jpg
+```
+
+## 4d) Vision Brain (Pi-local perception + planning)
+
+This service captures frames *on the Pi* (from the camera node on `127.0.0.1:8081`) and produces the next plan step.
+The desktop app should call this over HTTP. No camera feed is required on the laptop.
+
+Start brain service (port `8090`):
+```bash
+pkill -f pi_vision_brain_server.py || true
+nohup python3 daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/pi_vision_brain_server.py \
+  --port 8090 --snapshot-url http://127.0.0.1:8081/snapshot.jpg > ~/brain_node.log 2>&1 &
+ss -ltnp | egrep ':(8090)\\b' || true
+tail -n 80 ~/brain_node.log
+```
+
+Quick check (from laptop):
+```bash
+curl -s http://vporto26.local:8090/health
+curl -s -X POST http://vporto26.local:8090/vision_step \
+  -H 'Content-Type: application/json' \
+  -d '{"instruction":"move forward if there is no red object visible in the camera","state":{}}' | head
 ```
 
 ## 5) Healthcheck From Laptop
