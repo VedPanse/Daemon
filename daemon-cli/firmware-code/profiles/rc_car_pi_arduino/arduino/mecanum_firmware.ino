@@ -1,4 +1,6 @@
 #include <AFMotor.h>
+#include <ctype.h>
+#include <string.h>
 
 AF_DCMotor FL(1);
 AF_DCMotor FR(4);
@@ -6,6 +8,32 @@ AF_DCMotor RL(2);
 AF_DCMotor RR(3);
 
 int speedVal = 180;
+
+void runPrimitive(char cmd) {
+  switch (cmd) {
+    case 'F':
+      forward();
+      break;
+    case 'B':
+      backward();
+      break;
+    case 'L':
+      strafeLeft();
+      break;
+    case 'R':
+      strafeRight();
+      break;
+    case 'Q':
+      rotateLeft();
+      break;
+    case 'E':
+      rotateRight();
+      break;
+    default:
+      stopAll();
+      break;
+  }
+}
 
 void stopAll() {
   FL.run(RELEASE);
@@ -133,6 +161,60 @@ void rearAxleRightTurn(){
   RR.run(RELEASE);
 }
 
+// @daemon:export token=FWD desc="Move forward" args="speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_fwd
+void daemon_cmd_fwd(float speed) {
+  (void)speed;
+  forward();
+}
+
+// @daemon:export token=BWD desc="Move backward" args="speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_bwd
+void daemon_cmd_bwd(float speed) {
+  (void)speed;
+  backward();
+}
+
+// @daemon:export token=STRAFE desc="Strafe left/right" args="dir:string,speed:float[0..1]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_strafe
+void daemon_cmd_strafe(const char *dir, float speed) {
+  (void)speed;
+  if (dir == NULL || dir[0] == '\0') {
+    stopAll();
+    return;
+  }
+  char d = (char)toupper((unsigned char)dir[0]);
+  if (d == 'L') {
+    strafeLeft();
+  } else if (d == 'R') {
+    strafeRight();
+  } else {
+    stopAll();
+  }
+}
+
+// @daemon:export token=TURN desc="Rotate in place by signed degrees" args="degrees:float[-180..180]" safety="rate_hz=20,watchdog_ms=1200,clamp=true" function=daemon_cmd_turn
+void daemon_cmd_turn(float degrees) {
+  if (degrees < 0) {
+    rotateLeft();
+  } else if (degrees > 0) {
+    rotateRight();
+  } else {
+    stopAll();
+  }
+}
+
+// @daemon:export token=MECANUM desc="Direct primitive command (F,B,L,R,Q,E,S)" args="cmd:string" safety="rate_hz=30,watchdog_ms=1200,clamp=true" function=daemon_cmd_mecanum
+void daemon_cmd_mecanum(const char *cmd) {
+  if (cmd == NULL || cmd[0] == '\0') {
+    stopAll();
+    return;
+  }
+  runPrimitive((char)toupper((unsigned char)cmd[0]));
+}
+
+// @daemon:export token=STOP desc="Stop all motors" args="" safety="rate_hz=30,watchdog_ms=1200,clamp=true" function=daemon_cmd_stop
+void daemon_cmd_stop(void) {
+  stopAll();
+}
+
 void setup() {
   Serial.begin(9600);
   stopAll();
@@ -141,21 +223,6 @@ void setup() {
 void loop() {
   if (Serial.available()) {
     char cmd = Serial.read();
-
-    if(cmd=='F') forward();
-    else if(cmd=='B') backward();
-    else if(cmd=='L') strafeLeft();
-    else if(cmd=='R') strafeRight();
-    else if(cmd=='Q') rotateLeft();
-    else if(cmd=='E') rotateRight();
-    else if(cmd=='S') stopAll();
-    else if(cmd=='LF') leftFront();
-    else if(cmd=='RF') rightFront();
-    else if(cmd=='LR') leftRear();
-    else if(cmd=='RR') rightRear();
-    else if(cmd=='FALT') frontAxleLeftTurn();
-    else if(cmd=='FART') frontAxleRightTurn();
-    else if(cmd=='RALT') rearAxleleftTurn();
-    else if(cmd=='RART') rearAxleRightTurn();
+    runPrimitive((char)toupper((unsigned char)cmd));
   }
 }

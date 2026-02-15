@@ -61,7 +61,7 @@ def _dispatch_block(command: CommandSpec) -> str:
 
 def write_daemon_entry(generated_dir: Path, commands: list[CommandSpec]) -> None:
     declarations = "\n".join([_declare_fn(cmd) for cmd in commands])
-    blocks = "\n\n".join([_dispatch_block(cmd) for cmd in commands])
+    blocks = "\n\n".join([_dispatch_block(cmd) for cmd in commands if cmd.token != "STOP"])
 
     content = f'''#include "daemon_runtime.h"
 

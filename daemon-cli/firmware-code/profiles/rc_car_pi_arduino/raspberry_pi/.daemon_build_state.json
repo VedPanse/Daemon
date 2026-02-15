@@ -1,10 +1,10 @@
 {
   "root": "/Users/vedpanse/Daemon",
-  "started_at": 1771125277,
+  "started_at": 1771126233,
   "services": [
     {
       "name": "desktop_app",
-      "pid": 5201,
+      "pid": 14279,
       "cmd": [
         "npm",
         "run",
@@ -16,7 +16,7 @@
     },
     {
       "name": "vercel_api",
-      "pid": 5202,
+      "pid": 14280,
       "cmd": [
         "npm",
         "run",
@@ -27,7 +27,7 @@
     },
     {
       "name": "orchestrator",
-      "pid": 5204,
+      "pid": 14282,
       "cmd": [
         "python3",
         "orchestrator.py",

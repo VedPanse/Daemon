@@ -67,11 +67,5 @@ int daemon_entry_dispatch(const char *token, int argc, const char **argv) {
     return DAEMON_OK;
   }
 
-  if (strcmp(token, "STOP") == 0) {
-    if (argc != 0) return DAEMON_ERR_BAD_ARGS;
-    daemon_cmd_stop();
-    return DAEMON_OK;
-  }
-
   return DAEMON_ERR_BAD_TOKEN;
 }
