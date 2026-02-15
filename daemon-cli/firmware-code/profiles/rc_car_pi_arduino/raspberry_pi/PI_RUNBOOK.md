@@ -95,7 +95,7 @@ Start the claw node on port `8767`:
 ```bash
 pkill -f claw_daemon_node.py || true
 nohup python3 daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/claw_daemon_node.py \
-  --gpio 18 --port 8767 --node-id arm --pin-factory lgpio > ~/claw_node.log 2>&1 &
+  --gpio 18 --port 8767 --node-id arm --pin-factory lgpio --detach-after-move > ~/claw_node.log 2>&1 &
 ss -ltnp | egrep ':(8767)\\b' || true
 tail -n 60 ~/claw_node.log
 ```

@@ -93,29 +93,48 @@ class Claw:
         step: float,
         delay_s: float,
         pin_factory: str | None,
+        detach_after_move: bool,
     ):
         self._factory = _resolve_pin_factory(pin_factory)
-        self._servo = Servo(gpio_pin, pin_factory=self._factory) if self._factory else Servo(gpio_pin)
+        self._gpio_pin = int(gpio_pin)
+        self._servo: Servo | None = None
         self._lock = threading.Lock()
         self._hold = float(hold_value)
         self._open = float(open_value)
         self._step = max(0.001, float(step))
         self._delay = max(0.0, float(delay_s))
+        self._detach_after_move = bool(detach_after_move)
         self._state = "hold"
 
-        # Start gripping so we don't drop anything on boot.
+        # Start gripping so we don't drop things on boot.
+        self._ensure_servo()
+        assert self._servo is not None
         self._servo.value = self._hold
+        if self._detach_after_move:
+            # If the user wants zero jitter, detach immediately after reaching boot state.
+            self.detach()
 
     def state(self) -> str:
         return self._state
 
+    def _ensure_servo(self) -> None:
+        if self._servo is not None:
+            return
+        self._servo = (
+            Servo(self._gpio_pin, pin_factory=self._factory) if self._factory else Servo(self._gpio_pin)
+        )
+
     def detach(self) -> None:
+        if self._servo is None:
+            return
         try:
             self._servo.detach()
         except Exception:
             pass
+        self._servo = None
 
     def _move_smooth(self, target: float) -> None:
+        assert self._servo is not None
         pos = self._servo.value if self._servo.value is not None else self._hold
         while abs(pos - target) > self._step:
             pos = pos + self._step if pos < target else pos - self._step
@@ -129,14 +148,20 @@ class Claw:
             raise ValueError("invalid state")
         target = self._open if st == "open" else self._hold
         with self._lock:
+            self._ensure_servo()
+            assert self._servo is not None
             # Avoid repeated smoothing loops (can cause visible twitch) if we're already at target.
             current = self._servo.value
             if current is not None and abs(current - target) <= self._step:
                 self._servo.value = target
                 self._state = st
+                if self._detach_after_move:
+                    self.detach()
                 return
             self._move_smooth(target)
             self._state = st
+            if self._detach_after_move:
+                self.detach()
 
     def stop_safe(self) -> None:
         # "STOP" for a claw is: go to a safe gripping state.
@@ -314,6 +339,11 @@ def main() -> None:
         default="auto",
         help="GPIO backend: auto|pigpio|lgpio|default (default: auto)",
     )
+    ap.add_argument(
+        "--detach-after-move",
+        action="store_true",
+        help="Detach PWM after each move to reduce idle jitter (may reduce holding force).",
+    )
     ap.add_argument("--hold", type=float, default=-0.55, help="Hold (grip) position value")
     ap.add_argument("--open", type=float, default=-1.0, help="Open (release) position value")
     ap.add_argument("--step", type=float, default=0.02, help="Smoothing step size")
@@ -331,7 +361,15 @@ def main() -> None:
         pf = ""
     if pf == "default":
         pf = "default"
-    claw = Claw(args.gpio, args.hold, args.open, args.step, args.delay, pin_factory=pf if pf != "default" else None)
+    claw = Claw(
+        args.gpio,
+        args.hold,
+        args.open,
+        args.step,
+        args.delay,
+        pin_factory=pf if pf != "default" else None,
+        detach_after_move=bool(args.detach_after_move),
+    )
     watchdog = Watchdog(claw, args.watchdog_ms)
     threading.Thread(target=watchdog.loop, daemon=True).start()
 

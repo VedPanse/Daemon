@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=treehacks
 WorkingDirectory=/home/treehacks/Daemon
-ExecStart=/usr/bin/python3 /home/treehacks/Daemon/daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/claw_daemon_node.py --gpio 18 --port 8767 --node-id arm --pin-factory lgpio
+ExecStart=/usr/bin/python3 /home/treehacks/Daemon/daemon-cli/firmware-code/profiles/rc_car_pi_arduino/raspberry_pi/claw_daemon_node.py --gpio 18 --port 8767 --node-id arm --pin-factory lgpio --detach-after-move
 Restart=always
 RestartSec=1
 StandardOutput=append:/home/treehacks/claw_node.log
@@ -15,4 +15,3 @@ StandardError=append:/home/treehacks/claw_node.log
 
 [Install]
 WantedBy=multi-user.target
-
