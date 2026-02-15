@@ -713,6 +713,7 @@ def make_plan(
 
 def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
     execution_lock = threading.Lock()
+    pi_brain_url = "http://vporto26.local:8090/vision_step"
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
@@ -782,6 +783,66 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
                 with execution_lock:
                     orchestrator.emergency_stop(correlation_id=correlation_id)
                 self._write_json(200, {"ok": True, "correlation_id": correlation_id})
+                return
+
+            if self.path == "/pi_vision_step":
+                try:
+                    body = self._read_json_body()
+                    instruction = body.get("instruction")
+                    if not isinstance(instruction, str) or not instruction.strip():
+                        raise RuntimeError("instruction is required")
+                    correlation_id = (
+                        (body.get("correlation_id") if isinstance(body.get("correlation_id"), str) else None)
+                        or self.headers.get("X-Correlation-Id")
+                        or f"orch-{uuid.uuid4().hex[:12]}"
+                    )
+                    # If the client didn't include a system manifest, inject the orchestrator manifest.
+                    if not isinstance(body.get("system_manifest"), dict):
+                        body["system_manifest"] = orchestrator.merged_manifest()
+
+                    raw = json.dumps(body).encode("utf-8")
+                    req = urllib.request.Request(
+                        pi_brain_url,
+                        data=raw,
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Correlation-Id": correlation_id,
+                        },
+                    )
+                    _log_event("http.pi_vision_step.request", correlation_id, url=pi_brain_url)
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        resp_raw = resp.read()
+                        try:
+                            payload = json.loads(resp_raw.decode("utf-8"))
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError("pi brain returned invalid JSON") from exc
+                        if not isinstance(payload, dict):
+                            raise RuntimeError("pi brain returned non-object JSON")
+                except urllib.error.URLError as exc:
+                    _log_event("http.pi_vision_step.error", correlation_id if "correlation_id" in locals() else None, error=str(exc))
+                    self._write_json(
+                        502,
+                        {
+                            "ok": False,
+                            "error": f"pi brain unreachable: {exc}",
+                            **({"correlation_id": correlation_id} if "correlation_id" in locals() else {}),
+                        },
+                    )
+                    return
+                except Exception as exc:
+                    _log_event("http.pi_vision_step.error", correlation_id if "correlation_id" in locals() else None, error=str(exc))
+                    self._write_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            **({"correlation_id": correlation_id} if "correlation_id" in locals() else {}),
+                        },
+                    )
+                    return
+
+                self._write_json(200, payload)
                 return
 
             if self.path == "/execute_plan":

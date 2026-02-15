@@ -797,7 +797,7 @@ fn orchestrator_spawn(
 
     let http_host_raw = http_host.unwrap_or_else(|| "127.0.0.1".to_string());
     let http_host_ip = normalize_local_host(&http_host_raw)?;
-    let preferred_port = http_port.unwrap_or(5055);
+    let preferred_port = http_port.unwrap_or(5056);
     let http_port = pick_free_tcp_port(http_host_ip, preferred_port)?;
     let repo_root = find_repo_root()?;
     let orch_path = repo_root.join("orchestrator").join("orchestrator.py");

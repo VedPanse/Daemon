@@ -111,7 +111,7 @@ def _best_effort_kill_stale_dev_processes() -> None:
         subprocess.run(["pkill", "-f", pattern], check=False)
 
     # Also clear known local dev ports to avoid stale ownership.
-    for port in ["1420", "3000", "5055"]:
+    for port in ["1420", "3000", "5056"]:
         subprocess.run(["bash", "-lc", f"lsof -ti tcp:{port} | xargs -r kill -9"], check=False)
 
 
@@ -169,7 +169,7 @@ def handle_build(_args: argparse.Namespace) -> int:
                 "--node",
                 "cam=vporto26.local:8768",
                 "--http-port",
-                "5055",
+                "5056",
             ],
             orchestrator_dir,
         )

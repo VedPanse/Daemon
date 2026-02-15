@@ -3,7 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 
 const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
-const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
+const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5056";
 const DEFAULT_PI_BRAIN_BASE_URL = "http://vporto26.local:8090";
 const FRAME_WIDTH = 320;
 const FRAME_HEIGHT = 240;
@@ -814,8 +814,8 @@ function App() {
       });
       setLastSentInstruction(instructionToSend);
 
-      const visionBaseUrl = visionMode === "pi" ? PI_BRAIN_BASE_URL : VERCEL_BASE_URL;
-      const visionPath = visionMode === "pi" ? "/vision_step" : "/api/vision_step";
+      const visionBaseUrl = visionMode === "pi" ? orchestratorBaseUrl : VERCEL_BASE_URL;
+      const visionPath = visionMode === "pi" ? "/pi_vision_step" : "/api/vision_step";
       const visionResponse = await postVisionJson(visionBaseUrl, visionPath, visionPayload, correlationId);
       const nextState = visionResponse?.state || stateRef.current;
       const nextPlan = Array.isArray(visionResponse?.plan) ? visionResponse.plan : [];
