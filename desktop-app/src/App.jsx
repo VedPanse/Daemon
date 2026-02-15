@@ -79,19 +79,6 @@ async function captureFrameBase64(video, canvas) {
 }
 
 async function postVisionJson(url, body, correlationId) {
-  if (RUNTIME_IS_TAURI) {
-    try {
-      const base = new URL(url).origin;
-      return await invoke("vision_step_request", {
-        vercelBaseUrl: base,
-        payload: body,
-        correlationId
-      });
-    } catch (error) {
-      throw new Error(`Tauri proxy POST ${url} failed: ${String(error)}`);
-    }
-  }
-
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -689,7 +676,6 @@ function App() {
     inFlightRef.current = true;
     setSendingFrames(true);
 
-    let activeCorrelationId = null;
     try {
       await ensureCamera();
       const frame_jpeg_base64 = await captureFrameBase64(videoRef.current, captureCanvasRef.current);
@@ -699,7 +685,6 @@ function App() {
 
       const instructionToSend = appliedPromptRef.current.trim();
       const correlationId = makeCorrelationId();
-      activeCorrelationId = correlationId;
       const visionPayload = {
         frame_jpeg_base64,
         instruction: instructionToSend,
@@ -790,7 +775,7 @@ function App() {
       setLastOrchestratorError(msg);
       setLastActionText("STEP FAILED");
       setLastActionTimestamp(nowStamp());
-      appendTrace("vision.step.error", { error: msg, correlationId: activeCorrelationId });
+      appendTrace("vision.step.error", { error: msg });
 
       if (liveEnabled) {
         await stopLoop({ sendStop: true });

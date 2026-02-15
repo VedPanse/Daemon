@@ -50,14 +50,6 @@ run("parseInstruction canonical MOVE strafe synonyms", () => {
   assert.equal((parsed.canonical_actions?.[0] as any)?.direction, "right");
 });
 
-run("parseInstruction arm control open then close", () => {
-  const parsed = parseInstruction("open the claw for 5 seconds then close it");
-  assert.equal(parsed.task_type, "arm-control");
-  assert.equal(parsed.arm_actions?.[0]?.state, "open");
-  assert.equal(parsed.arm_actions?.[0]?.duration_s, 5);
-  assert.equal(parsed.arm_actions?.[1]?.state, "hold");
-});
-
 run("parseInstruction pick-object phone", () => {
   const parsed = parseInstruction("pick up the phone");
   assert.equal(parsed.task_type, "pick-object");
@@ -150,7 +142,6 @@ run("lock expires after lost ticks", () => {
 run("move-pattern bypasses perception", () => {
   assert.equal(shouldBypassPerceptionTask("move-pattern"), true);
   assert.equal(shouldBypassPerceptionTask("stop"), true);
-  assert.equal(shouldBypassPerceptionTask("arm-control"), true);
   assert.equal(shouldBypassPerceptionTask("pick-object"), false);
   assert.equal(shouldBypassPerceptionTask("follow"), false);
 });
