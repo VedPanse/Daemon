@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use serialport::SerialPort;
+use base64::Engine as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,9 @@ struct CriticStepResult {
     success_confidence: f64,
     success_streak: u32,
     success_stable: bool,
+    motion_score: f64,
+    motion_gate: bool,
+    motion_gate_reason: String,
     critical_failure: bool,
     critical_failure_reason: String,
     failure_modes: Vec<String>,
@@ -362,6 +366,64 @@ fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
+fn task_expects_motion(task: &str) -> bool {
+    let t = task.to_ascii_lowercase();
+    let keywords = [
+        "move", "drive", "go ", "forward", "backward", "reverse", "left", "right", "turn", "rotate", "strafe", "spin",
+    ];
+    keywords.iter().any(|k| t.contains(k))
+}
+
+fn decode_frame_luma_small(frame_b64: &str, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let b64 = frame_b64.trim();
+    if b64.is_empty() {
+        return Err("empty frame".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("image decode failed: {e}"))?;
+    let gray = img.to_luma8();
+    let small = image::imageops::resize(&gray, w, h, image::imageops::FilterType::Triangle);
+    Ok(small.into_raw())
+}
+
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> Result<f64, String> {
+    if a.len() != b.len() || a.is_empty() {
+        return Err("mean_abs_diff: length mismatch".to_string());
+    }
+    let mut acc: u64 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc += x.abs_diff(*y) as u64;
+    }
+    let mean = (acc as f64) / (a.len() as f64);
+    Ok(mean / 255.0)
+}
+
+fn compute_motion_score(frames_b64: &[String]) -> Result<f64, String> {
+    let frames: Vec<&str> = frames_b64.iter().map(|s| s.as_str()).filter(|s| !s.trim().is_empty()).collect();
+    if frames.len() < 2 {
+        return Ok(0.0);
+    }
+
+    // Downscale heavily for robustness and speed; this is only a "stationary vs moving" gate.
+    let w = 96;
+    let h = 72;
+    let mut prev = decode_frame_luma_small(frames[0], w, h)?;
+    let mut scores: Vec<f64> = Vec::new();
+    for f in frames.iter().skip(1).take(5) {
+        let cur = decode_frame_luma_small(f, w, h)?;
+        let s = mean_abs_diff(&prev, &cur)?;
+        scores.push(s);
+        prev = cur;
+    }
+    if scores.is_empty() {
+        return Ok(0.0);
+    }
+    let avg = scores.iter().sum::<f64>() / (scores.len() as f64);
+    Ok(avg)
+}
+
 fn repo_logs_dir() -> Result<PathBuf, String> {
     Ok(find_repo_root()?.join("logs"))
 }
@@ -647,6 +709,10 @@ Your job: evaluate the current camera frame against the user's task goal and pro
 \n\
 You may be given multiple frames (ordered oldest -> newest). Use them to infer motion and progress.\n\
 \n\
+Hard constraints:\n\
+- If the robot is not clearly visible: success=false.\n\
+- If there is little/no visible motion across frames (or motion is ambiguous): success=false.\n\
+\n\
 Output rules:\n\
 - Return ONLY strict JSON that matches the provided schema.\n\
 - Be conservative: if uncertain, success=false and success_confidence<=0.5.\n\
@@ -673,6 +739,7 @@ async fn openai_critic_eval(
     model: &str,
     task: &str,
     frames_jpeg_base64: &[String],
+    motion_score: Option<f64>,
     last_action_text: Option<&str>,
     executed_plan: Option<&Value>,
     correlation_id: Option<&str>,
@@ -693,6 +760,12 @@ async fn openai_critic_eval(
         // Keep it compact; tool output remains the source of truth.
         let plan_short = trunc_for_log(&plan.to_string(), 800);
         user_lines.push(format!("Executed plan (json): {plan_short}"));
+    }
+    if let Some(ms) = motion_score {
+        user_lines.push(format!(
+            "Computed pixel motion score across frames: {:.4} (0.0 means no visible motion). If < 0.004 treat as no progress.",
+            ms
+        ));
     }
     user_lines.push("If robot/target is not clearly visible, do not claim success.".to_string());
     let user_text = user_lines.join("\n");
@@ -724,7 +797,7 @@ async fn openai_critic_eval(
     let frames = frames_jpeg_base64
         .iter()
         .filter(|s| !s.trim().is_empty())
-        .take(4)
+        .take(6)
         .cloned()
         .collect::<Vec<_>>();
     if frames.is_empty() {
@@ -1020,11 +1093,11 @@ fn critic_spawn(
     *lock = Some(CriticSession {
         orchestrator_base_url: orchestrator_base_url.trim().to_string(),
         task: task.clone(),
-        model: model.unwrap_or_else(|| "gpt-4.1-mini".to_string()),
+        model: model.unwrap_or_else(|| "gpt-5.2".to_string()),
         success_streak: 0,
         success_n: success_consecutive_frames.unwrap_or(3).max(1),
         conf_threshold: success_confidence_threshold.unwrap_or(0.9),
-        reward_threshold: success_reward_threshold.unwrap_or(0.9),
+        reward_threshold: success_reward_threshold.unwrap_or(0.1),
     });
 
     Ok(CriticStatus {
@@ -1091,32 +1164,51 @@ async fn critic_step(
 
     let cid = correlation_id.clone().unwrap_or_else(|| format!("ui-{}", unix_ts_ms()));
     let task_to_use = task_override.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or(task.as_str());
+    let motion_score = compute_motion_score(&frames_jpeg_base64).unwrap_or(0.0);
     let raw = openai_critic_eval(
         &model,
         task_to_use,
         &frames_jpeg_base64,
+        Some(motion_score),
         last_action_text.as_deref(),
         executed_plan.as_ref(),
         Some(&cid),
     )
     .await?;
 
-    let reward = clamp_f64(raw.get("reward").and_then(|v| v.as_f64()).unwrap_or(0.0), -1.0, 1.0);
-    let success = raw.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-    let conf = clamp_f64(raw.get("success_confidence").and_then(|v| v.as_f64()).unwrap_or(0.0), 0.0, 1.0);
+    let mut reward = clamp_f64(raw.get("reward").and_then(|v| v.as_f64()).unwrap_or(0.0), -1.0, 1.0);
+    let mut success = raw.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut conf = clamp_f64(raw.get("success_confidence").and_then(|v| v.as_f64()).unwrap_or(0.0), 0.0, 1.0);
     let critical = raw.get("critical_failure").and_then(|v| v.as_bool()).unwrap_or(false);
     let critical_reason = raw
         .get("critical_failure_reason")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let failure_modes = raw
+    let mut failure_modes = raw
         .get("failure_modes")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
         .unwrap_or_else(|| vec!["uncertain".to_string()]);
 
-    let success_this_frame = success && conf >= conf_th && reward >= reward_th;
+    // Motion gating: prevent stationary hallucinations from counting as success.
+    let mut motion_gate = false;
+    let mut motion_gate_reason = String::new();
+    if task_expects_motion(task_to_use) && motion_score < 0.004 {
+        motion_gate = true;
+        motion_gate_reason = format!("low_motion(score={motion_score:.4})");
+        success = false;
+        conf = conf.min(0.2);
+        reward = reward.min(0.0);
+        if !failure_modes.iter().any(|m| m == "no_progress") {
+            failure_modes.push("no_progress".to_string());
+        }
+    }
+    if failure_modes.iter().any(|m| m == "uncertain" || m == "not_visible" || m == "target_not_visible") {
+        success = false;
+    }
+
+    let success_this_frame = success && conf >= conf_th && reward >= reward_th && !motion_gate;
 
     // Update streak under lock (no await).
     let (streak, stable) = {
@@ -1148,6 +1240,9 @@ async fn critic_step(
         success_confidence: conf,
         success_streak: streak,
         success_stable: stable,
+        motion_score,
+        motion_gate,
+        motion_gate_reason,
         critical_failure: critical,
         critical_failure_reason: critical_reason,
         failure_modes,

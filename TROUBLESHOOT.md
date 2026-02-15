@@ -134,6 +134,9 @@ hostname -I
 Then use `--node base=<PI_IP>:8766` on the laptop.
 
 2) If using Ethernet, physically reseat the cable and confirm link lights.
+   - Tighten/secure the connector: if it's a loose RJ45 jack or adapter, use a different cable, add strain relief (tape/zip-tie to the chassis), and avoid putting lateral force on the port.
+   - If using a USB-to-Ethernet dongle, reseat the dongle too (they can wiggle loose under motion).
+   - If it keeps happening, switch from `.local` to a fixed IPv4 as above so reconnects are immediate.
 
 3) If Wi-Fi, reduce latency/jitter (closer AP, avoid hotspots).
 
@@ -201,4 +204,3 @@ Artifacts:
 - Judge cache: `.daemon/judge_cache.json`
 
 If the engine can’t see the robot (no motion + no OpenAI key), it will fail closed with STOP.
-

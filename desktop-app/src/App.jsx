@@ -325,8 +325,11 @@ function App() {
   const criticTimerRef = useRef(null);
   const criticEnabledRef = useRef(false);
   const criticInFlightRef = useRef(false);
+  const criticLoopFnRef = useRef(null);
+  const criticQualStreakRef = useRef(0);
   const loopIntervalRef = useRef(DEFAULT_CAPTURE_INTERVAL_MS);
   const inFlightRef = useRef(false);
+  const pendingStepRef = useRef(null);
   const stateRef = useRef(INITIAL_STATE);
   const appliedPromptRef = useRef(DEFAULT_PROMPT);
 
@@ -348,10 +351,11 @@ function App() {
   const [criticEnabled, setCriticEnabled] = useState(false);
   const [criticError, setCriticError] = useState("");
   const [criticResult, setCriticResult] = useState(null);
-  const [criticModel, setCriticModel] = useState("gpt-4.1-mini");
-  const [criticSuccessN, setCriticSuccessN] = useState(3);
-  const [criticConfTh, setCriticConfTh] = useState(0.9);
-  const [criticRewardTh, setCriticRewardTh] = useState(0.9);
+  const [criticDoneText, setCriticDoneText] = useState("");
+  const [criticModel, setCriticModel] = useState("gpt-5.2");
+  const [criticSuccessN, setCriticSuccessN] = useState(2);
+  const [criticConfTh, setCriticConfTh] = useState(0.4);
+  const [criticRewardTh, setCriticRewardTh] = useState(0.1);
 
   const [fsmState, setFsmState] = useState(INITIAL_STATE);
   const [perception, setPerception] = useState(null);
@@ -470,6 +474,18 @@ function App() {
       await executeSingleVisionStep({ executePlan: !dryRun });
     } else {
       appendTrace("prompt.apply.deferred", { reason: "critic_running" });
+      // Make Send feel responsive while Critic is running: schedule a near-immediate tick.
+      try {
+        if (criticTimerRef.current) {
+          clearTimeout(criticTimerRef.current);
+          criticTimerRef.current = null;
+        }
+        if (typeof criticLoopFnRef.current === "function") {
+          criticTimerRef.current = setTimeout(criticLoopFnRef.current, 30);
+        }
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -822,8 +838,12 @@ function App() {
     };
   }, []);
 
-  const executeSingleVisionStep = async ({ executePlan, frameJpegBase64Override = null, correlationIdOverride = null } = {}) => {
+  const executeSingleVisionStep = async (
+    { executePlan, frameJpegBase64Override = null, correlationIdOverride = null, _macroStopRetry = true } = {}
+  ) => {
     if (inFlightRef.current) {
+      pendingStepRef.current = { executePlan, frameJpegBase64Override, correlationIdOverride };
+      appendTrace("vision.step.queued", { executePlan: Boolean(executePlan), reason: "in_flight" });
       return;
     }
 
@@ -833,6 +853,7 @@ function App() {
     }
 
     inFlightRef.current = true;
+    pendingStepRef.current = null;
     setSendingFrames(true);
 
     try {
@@ -881,6 +902,7 @@ function App() {
         camera_meta,
         state: stateRef.current
       };
+      let capturedFrame = null;
       if (visionMode !== "pi") {
         const frame_jpeg_base64 =
           frameJpegBase64Override ||
@@ -897,6 +919,7 @@ function App() {
         if (!frame_jpeg_base64) {
           throw new Error("camera frame unavailable");
         }
+        capturedFrame = frame_jpeg_base64;
         visionPayload.frame_jpeg_base64 = frame_jpeg_base64;
       }
       appendTrace("vision.step.request", {
@@ -911,7 +934,35 @@ function App() {
 
       const visionBaseUrl = visionMode === "pi" ? orchestratorBaseUrl : VERCEL_BASE_URL;
       const visionPath = visionMode === "pi" ? "/pi_vision_step" : "/api/vision_step";
-      const visionResponse = await postVisionJson(visionBaseUrl, visionPath, visionPayload, correlationId);
+      let visionResponse = await postVisionJson(visionBaseUrl, visionPath, visionPayload, correlationId);
+      // If the state machine thinks it already emitted the motion macro, it can return STOP forever.
+      // Auto-reset and retry once to make "Send" behave like "do it again".
+      if (
+        _macroStopRetry &&
+        executePlan &&
+        Array.isArray(visionResponse?.plan) &&
+        visionResponse.plan.length === 1 &&
+        String(visionResponse.plan[0]?.type || "") === "STOP" &&
+        String(visionResponse?.debug?.notes || "").includes("motion macro already emitted")
+      ) {
+        appendTrace("vision.step.autoreset", { reason: "macro_already_emitted_stop", correlationId });
+        const seeded = { ...INITIAL_STATE, capabilities: { ...capabilities } };
+        stateRef.current = seeded;
+        setFsmState(seeded);
+        setPerception(null);
+        setLastPlan([]);
+        setLastDebug(null);
+        setChartSeries([]);
+        const retryCorrelationId = `${correlationId}-r1`;
+        const retryPayload = {
+          ...visionPayload,
+          correlation_id: retryCorrelationId,
+          state: seeded
+        };
+        if (capturedFrame) retryPayload.frame_jpeg_base64 = capturedFrame;
+        visionResponse = await postVisionJson(visionBaseUrl, visionPath, retryPayload, retryCorrelationId);
+      }
+
       const nextState = visionResponse?.state || stateRef.current;
       const nextPlan = Array.isArray(visionResponse?.plan) ? visionResponse.plan : [];
       const planCorrelationId = String(visionResponse?.correlation_id || correlationId);
@@ -1000,6 +1051,26 @@ function App() {
     } finally {
       inFlightRef.current = false;
       setSendingFrames(false);
+      const pending = pendingStepRef.current;
+      if (pending) {
+        // Keep the latest queued step; schedule it in a safe place depending on mode.
+        if (!liveEnabledRef.current && !criticEnabledRef.current) {
+          pendingStepRef.current = null;
+          setTimeout(() => {
+            void executeSingleVisionStep({ ...pending, _macroStopRetry: true });
+          }, 20);
+        } else if (criticEnabledRef.current) {
+          // Let the critic loop drive execution; just nudge it.
+          try {
+            if (typeof criticLoopFnRef.current === "function") {
+              if (criticTimerRef.current) clearTimeout(criticTimerRef.current);
+              criticTimerRef.current = setTimeout(criticLoopFnRef.current, 50);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
     }
   };
 
@@ -1053,11 +1124,13 @@ function App() {
 
   const stopCriticLoop = async () => {
     criticEnabledRef.current = false;
+    criticQualStreakRef.current = 0;
     setCriticEnabled(false);
     if (criticTimerRef.current) {
       clearTimeout(criticTimerRef.current);
       criticTimerRef.current = null;
     }
+    criticLoopFnRef.current = null;
     if (RUNTIME_IS_TAURI) {
       try {
         await invoke("critic_stop");
@@ -1080,6 +1153,8 @@ function App() {
 
     setCriticError("");
     setCriticResult(null);
+    setCriticDoneText("");
+    criticQualStreakRef.current = 0;
     setCriticEnabled(true);
     criticEnabledRef.current = true;
 
@@ -1087,6 +1162,10 @@ function App() {
     if (liveEnabledRef.current) {
       await stopLoop({ sendStop: false });
     }
+
+    // Critical: if the last run left the policy in MOTION_ONLY with a macro already emitted,
+    // the critic loop would only ever execute STOP. Reset so the first tick emits a fresh plan.
+    resetSessionStateForPrompt();
 
     try {
       await ensureCamera({ force: true });
@@ -1098,12 +1177,17 @@ function App() {
 
     try {
       await invoke("critic_spawn", {
+        // Provide both camelCase + snake_case keys to avoid relying on implicit case conversion.
         orchestratorBaseUrl,
+        orchestrator_base_url: orchestratorBaseUrl,
         task,
         model: criticModel,
         successConsecutiveFrames: Number(criticSuccessN),
+        success_consecutive_frames: Number(criticSuccessN),
         successConfidenceThreshold: Number(criticConfTh),
-        successRewardThreshold: Number(criticRewardTh)
+        success_confidence_threshold: Number(criticConfTh),
+        successRewardThreshold: Number(criticRewardTh),
+        success_reward_threshold: Number(criticRewardTh)
       });
     } catch (error) {
       await stopCriticLoop();
@@ -1143,9 +1227,12 @@ function App() {
           correlationIdOverride: correlationId
         });
 
-        // Capture a couple post-action frames so the critic can detect motion/progress.
-        await sleep(260);
-        const frame1 = await (() => {
+        const planForTiming = Array.isArray(exec?.plan) && exec.plan.length ? exec.plan : Array.isArray(lastPlan) ? lastPlan : [];
+        const totalDurMs = planForTiming
+          .filter((s) => s && s.type === "RUN" && Number(s.duration_ms || 0) > 0)
+          .reduce((acc, s) => acc + Number(s.duration_ms || 0), 0);
+
+        const capture = async () => {
           if (effectiveCameraMode !== "remote") {
             return captureFrameBase64(videoRef.current, captureCanvasRef.current);
           }
@@ -1154,45 +1241,95 @@ function App() {
             throw new Error("robot camera selected but snapshot_url is empty");
           }
           return fetchSnapshotBase64(snapUrl);
-        })();
-        await sleep(260);
-        const frame2 = await (() => {
-          if (effectiveCameraMode !== "remote") {
-            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+        };
+
+        // Capture post-action frames across the full plan window (helps detect left->right sequences).
+        const postFrames = [];
+        if (totalDurMs > 0) {
+          const sampleTimes = [0.25, 0.6, 1.0].map((p) => Math.max(250, Math.min(3200, Math.round(totalDurMs * p))));
+          let elapsed = 0;
+          for (const t of sampleTimes) {
+            const wait = Math.max(250, t - elapsed);
+            await sleep(wait);
+            elapsed += wait;
+            postFrames.push(await capture());
           }
-          const snapUrl = String(cameraSnapshotUrl || "").trim();
-          if (!snapUrl) {
-            throw new Error("robot camera selected but snapshot_url is empty");
-          }
-          return fetchSnapshotBase64(snapUrl);
-        })();
+        } else {
+          await sleep(700);
+          postFrames.push(await capture());
+          await sleep(700);
+          postFrames.push(await capture());
+        }
 
         const taskOverride = (taskPrompt || "").trim() || (draftPrompt || "").trim();
-        const framesJpegBase64 = [frame0, frame1, frame2].filter(Boolean);
+        const framesJpegBase64 = [frame0, ...postFrames].filter(Boolean);
         const result = await invoke("critic_step", {
           framesJpegBase64,
+          frames_jpeg_base64: framesJpegBase64,
           lastActionText,
+          last_action_text: lastActionText,
           executedPlan: exec?.plan || lastPlan,
+          executed_plan: exec?.plan || lastPlan,
           taskOverride,
-          correlationId
+          task_override: taskOverride,
+          correlationId,
+          correlation_id: correlationId
         });
         setCriticResult(result);
         setLastDebug((prev) => ({ ...(prev || {}), critic: result }));
 
-        if (result?.successStable) {
+        appendTrace("critic.step.response", {
+          correlationId,
+          reward: Number(result?.reward || 0),
+          conf: Number(result?.successConfidence || 0),
+          success: Boolean(result?.success),
+          streak: Number(result?.successStreak || 0),
+          stable: Boolean(result?.successStable),
+          motionScore: Number(result?.motionScore || 0),
+          motionGate: Boolean(result?.motionGate)
+        });
+
+        const failureModes = Array.isArray(result?.failureModes) ? result.failureModes : [];
+        const failClosed = failureModes.includes("uncertain") || failureModes.includes("not_visible") || failureModes.includes("target_not_visible");
+        const qualifies =
+          Number(result?.successConfidence || 0) >= Number(criticConfTh) &&
+          Number(result?.reward || 0) >= Number(criticRewardTh) &&
+          !Boolean(result?.motionGate) &&
+          !Boolean(result?.criticalFailure) &&
+          !failClosed;
+
+        criticQualStreakRef.current = qualifies ? criticQualStreakRef.current + 1 : 0;
+        const streak = Math.max(Number(result?.successStreak || 0), criticQualStreakRef.current);
+        const stable = Boolean(result?.successStable) || criticQualStreakRef.current >= Number(criticSuccessN);
+
+        if (stable) {
+          // Make stopping atomic even if React batching delays state updates.
+          criticEnabledRef.current = false;
+          if (criticTimerRef.current) {
+            clearTimeout(criticTimerRef.current);
+            criticTimerRef.current = null;
+          }
+          setCriticEnabled(false);
+          setCriticDoneText(`Trained: success stable (streak=${streak}/${Number(criticSuccessN)}).`);
           await stopCriticLoop();
+          appendTrace("critic.done", { reason: "success_stable", streak, n: Number(criticSuccessN) });
+          return;
         }
       } catch (error) {
         setCriticError(String(error));
         await stopCriticLoop();
+        return;
       } finally {
         criticInFlightRef.current = false;
       }
 
       // Each tick hits vision + orchestrator + OpenAI; keep it moderate.
-      criticTimerRef.current = setTimeout(loop, 450);
+      if (criticEnabledRef.current) {
+        criticTimerRef.current = setTimeout(loop, 450);
+      }
     };
 
+    criticLoopFnRef.current = loop;
     criticTimerRef.current = setTimeout(loop, 80);
   };
 
@@ -1394,6 +1531,7 @@ function App() {
             Success is only stable after {criticSuccessN} consecutive high-confidence frames.
           </div>
           {criticError ? <div className="error">Critic: {criticError}</div> : null}
+          {criticDoneText ? <div className="note"><strong>{criticDoneText}</strong></div> : null}
           <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             <span>model</span>
             <input value={criticModel} onChange={(e) => setCriticModel(e.target.value)} style={{ width: 140 }} />

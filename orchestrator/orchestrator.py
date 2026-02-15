@@ -187,8 +187,48 @@ class Orchestrator:
 
         node.running = False
 
+    def _connect_socket(self, host: str, port: int) -> socket.socket:
+        """
+        Create a TCP connection with robust address selection.
+
+        mDNS hosts (e.g. *.local) often resolve to both IPv6 link-local and IPv4.
+        On many setups, the IPv6 link-local address is not reachable without a scope id,
+        and naive connection attempts can hang or fail. We prefer IPv4, then fall back.
+        """
+        last_exc: Exception | None = None
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            # Fall back to create_connection (will re-raise if broken).
+            last_exc = exc
+            infos = []
+
+        # Prefer IPv4 first, then others.
+        infos_sorted = sorted(infos, key=lambda it: 0 if it[0] == socket.AF_INET else 1)
+        for family, socktype, proto, _canon, sockaddr in infos_sorted:
+            try:
+                s = socket.socket(family, socktype, proto)
+                s.settimeout(self.timeout_s)
+                s.connect(sockaddr)
+                return s
+            except OSError as exc:
+                last_exc = exc
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                continue
+
+        # Final fallback (handles weird platforms where getaddrinfo didn't help).
+        try:
+            return socket.create_connection((host, port), timeout=self.timeout_s)
+        except OSError as exc:
+            last_exc = exc
+
+        raise last_exc if last_exc is not None else RuntimeError("connect failed")
+
     def _connect_node(self, node: NodeInfo) -> None:
-        node.sock = socket.create_connection((node.host, node.port), timeout=self.timeout_s)
+        node.sock = self._connect_socket(node.host, node.port)
         node.running = True
         if self.enable_telemetry:
             node.reader_thread = threading.Thread(target=self._reader_loop, args=(node,), daemon=True)
@@ -334,8 +374,10 @@ class Orchestrator:
             if token not in duplicates:
                 self.catalog_unqualified[token] = owner
 
-    def merged_manifest(self) -> dict[str, Any]:
-        self.maybe_reconnect_disconnected()
+    def merged_manifest(self, allow_reconnect: bool = True) -> dict[str, Any]:
+        # /status should be fast and should not block on reconnect attempts.
+        if allow_reconnect:
+            self.maybe_reconnect_disconnected()
         nodes: list[dict[str, Any]] = []
         for node in self.nodes:
             services_in = node.manifest.get("services") if isinstance(node.manifest.get("services"), dict) else {}
@@ -761,6 +803,9 @@ def make_plan(
 
 
 def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
+    # Prevent concurrent plans from interleaving on the wire, but NEVER let /stop hang.
+    # If a plan thread wedges while holding the lock, /execute_plan should fail fast with 409
+    # and /stop should still send best-effort STOPs.
     execution_lock = threading.Lock()
     pi_brain_url = "http://vporto26.local:8090/vision_step"
 
@@ -821,7 +866,7 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
                 {
                     "ok": True,
                     "nodes": nodes_summary,
-                    "system_manifest": orchestrator.merged_manifest(),
+                    "system_manifest": orchestrator.merged_manifest(allow_reconnect=False),
                 },
             )
 
@@ -829,8 +874,13 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
             if self.path == "/stop":
                 correlation_id = self.headers.get("X-Correlation-Id") or f"orch-{uuid.uuid4().hex[:12]}"
                 _log_event("http.stop.request", correlation_id)
-                with execution_lock:
+                # Do NOT take execution_lock here. /stop must be able to interrupt even if
+                # a plan is currently running or a previous handler thread is wedged.
+                try:
                     orchestrator.emergency_stop(correlation_id=correlation_id)
+                except Exception as exc:
+                    self._write_json(500, {"ok": False, "error": str(exc), "correlation_id": correlation_id})
+                    return
                 self._write_json(200, {"ok": True, "correlation_id": correlation_id})
                 return
 
@@ -847,7 +897,7 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
                     )
                     # If the client didn't include a system manifest, inject the orchestrator manifest.
                     if not isinstance(body.get("system_manifest"), dict):
-                        body["system_manifest"] = orchestrator.merged_manifest()
+                        body["system_manifest"] = orchestrator.merged_manifest(allow_reconnect=False)
 
                     raw = json.dumps(body).encode("utf-8")
                     req = urllib.request.Request(
@@ -907,9 +957,26 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
                     )
                     _log_event("http.execute_plan.request", correlation_id, plan_len=len(plan), plan=plan)
 
-                    with execution_lock:
+                    # Fail fast if we're already executing a plan. Blocking here causes callers
+                    # to time out and makes the system look "dead" even though /status works.
+                    if not execution_lock.acquire(blocking=False):
+                        self._write_json(
+                            409,
+                            {
+                                "ok": False,
+                                "error": "orchestrator_busy: another plan is executing (or wedged). Try STOP or restart orchestrator.",
+                                "correlation_id": correlation_id,
+                            },
+                        )
+                        return
+                    try:
                         orchestrator.validate_plan(plan, correlation_id=correlation_id)
                         orchestrator.execute_plan(plan, correlation_id=correlation_id)
+                    finally:
+                        try:
+                            execution_lock.release()
+                        except RuntimeError:
+                            pass
                 except Exception as exc:
                     _log_event("http.execute_plan.error", correlation_id if "correlation_id" in locals() else None, error=str(exc))
                     self._write_json(
