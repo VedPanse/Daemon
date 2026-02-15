@@ -32,6 +32,8 @@ class NodeInfo:
     telemetry_snapshot: dict[str, str] = field(default_factory=dict)
     telemetry_subscribed: bool = False
     read_buffer: bytearray = field(default_factory=bytearray)
+    reconnect_lock: threading.Lock = field(default_factory=threading.Lock)
+    last_reconnect_attempt_s: float = 0.0
 
 
 def _now_iso() -> str:
@@ -90,6 +92,43 @@ class Orchestrator:
         self._build_catalogs()
         if errors:
             _log_event("orchestrator.connect_all.degraded", nodes_failed=len(errors), errors=errors)
+
+    def maybe_reconnect_disconnected(self, min_interval_s: float = 2.5) -> None:
+        """
+        Best-effort reconnection for nodes that failed at startup.
+
+        This eliminates the common "stuck disconnected forever" case when the orchestrator came up
+        while mDNS / Ethernet / USB was flaky. Safe to call frequently; it rate-limits per node.
+        """
+        any_change = False
+        now = time.monotonic()
+        for node in self.nodes:
+            if node.sock is not None and node.running:
+                continue
+            if now - float(node.last_reconnect_attempt_s or 0.0) < min_interval_s:
+                continue
+            node.last_reconnect_attempt_s = now
+            with node.reconnect_lock:
+                if node.sock is not None and node.running:
+                    continue
+                try:
+                    self._reconnect_node(node)
+                    any_change = True
+                except Exception as exc:
+                    node.running = False
+                    if node.sock is not None:
+                        try:
+                            node.sock.close()
+                        except OSError:
+                            pass
+                    node.sock = None
+                    node.manifest = {}
+                    node.node_name = ""
+                    node.node_id = ""
+                    _log_event("node.reconnect.error", node=node.alias, error=str(exc))
+
+        if any_change:
+            self._build_catalogs()
 
     def close_all(self) -> None:
         for node in self.nodes:
@@ -239,8 +278,13 @@ class Orchestrator:
                 pass
 
     def _request(self, node: NodeInfo, line: str, timeout: float | None = None, correlation_id: str | None = None) -> str:
-        if node.sock is None:
-            raise RuntimeError(f"{node.alias}: not connected")
+        if node.sock is None or not node.running:
+            with node.reconnect_lock:
+                if node.sock is None or not node.running:
+                    try:
+                        self._reconnect_node(node)
+                    except Exception as exc:
+                        raise RuntimeError(f"{node.alias}: not connected") from exc
 
         wait = self.timeout_s if timeout is None else timeout
         _log_event("transport.tx", correlation_id, node=node.alias, line=line, timeout_s=wait)
@@ -251,8 +295,9 @@ class Orchestrator:
             except OSError as exc:
                 # If the peer closed (Broken pipe / reset), reconnect and retry once.
                 try:
-                    self._reconnect_node(node)
-                    assert node.sock is not None
+                    with node.reconnect_lock:
+                        self._reconnect_node(node)
+                        assert node.sock is not None
                     with node.write_lock:
                         node.sock.sendall((line + "\n").encode("utf-8"))
                 except Exception:
@@ -269,6 +314,8 @@ class Orchestrator:
         return response
 
     def _build_catalogs(self) -> None:
+        self.catalog_qualified = {}
+        self.catalog_unqualified = {}
         first_owner: dict[str, NodeInfo] = {}
         duplicates: set[str] = set()
 
@@ -288,6 +335,7 @@ class Orchestrator:
                 self.catalog_unqualified[token] = owner
 
     def merged_manifest(self) -> dict[str, Any]:
+        self.maybe_reconnect_disconnected()
         nodes: list[dict[str, Any]] = []
         for node in self.nodes:
             services_in = node.manifest.get("services") if isinstance(node.manifest.get("services"), dict) else {}
@@ -412,6 +460,7 @@ class Orchestrator:
     def validate_plan(self, plan: list[dict[str, Any]], correlation_id: str | None = None) -> None:
         if not isinstance(plan, list):
             raise RuntimeError("plan must be a list")
+        self.maybe_reconnect_disconnected()
         _log_event("orchestrator.validate_plan.start", correlation_id, plan_len=len(plan))
 
         for index, step in enumerate(plan):
@@ -881,8 +930,35 @@ def run_http_bridge(orchestrator: Orchestrator, host: str, port: int) -> None:
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-    server = http.server.ThreadingHTTPServer((host, port), Handler)
-    print(f"http bridge listening on http://{host}:{port}")
+    def _status_ok(h: str, p: int) -> bool:
+        try:
+            url = f"http://{h}:{p}/status"
+            with urllib.request.urlopen(url, timeout=0.4) as resp:
+                if resp.status != 200:
+                    return False
+                body = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body)
+            return isinstance(parsed, dict) and bool(parsed.get("ok")) and isinstance(parsed.get("system_manifest"), dict)
+        except Exception:
+            return False
+
+    try:
+        server = http.server.ThreadingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        # Improve UX: if the requested port is already in use, fall back to an ephemeral port
+        # instead of crashing (common when an old orchestrator instance is still running).
+        if getattr(exc, "errno", None) in {48, 98} and port != 0:  # macOS=48, Linux=98
+            # If the existing listener is already a DAEMON orchestrator, reuse it rather than spawning another.
+            if _status_ok(host, port):
+                print(f"info: orchestrator already listening on http://{host}:{port}; reusing existing instance")
+                return
+            print(f"warning: http port {port} already in use; falling back to an ephemeral port")
+            server = http.server.ThreadingHTTPServer((host, 0), Handler)
+        else:
+            raise
+
+    actual_host, actual_port = server.server_address[:2]
+    print(f"http bridge listening on http://{actual_host}:{actual_port}")
     try:
         server.serve_forever()
     finally:

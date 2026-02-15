@@ -13,6 +13,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
 const SERIAL_EVENT: &str = "serial_line";
+const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CriticStatus {
+    running: bool,
+    task: Option<String>,
+    model: Option<String>,
+    success_streak: u32,
+    success_n: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CriticStepResult {
+    reward: f64,
+    success: bool,
+    success_confidence: f64,
+    success_streak: u32,
+    success_stable: bool,
+    critical_failure: bool,
+    critical_failure_reason: String,
+    failure_modes: Vec<String>,
+    describe: String,
+    evaluate: String,
+    notes_short: String,
+    interrupt_sent: bool,
+    raw: Value,
+}
 
 #[derive(Clone)]
 struct SerialSession {
@@ -39,6 +68,18 @@ struct OrchestratorProcess {
 struct AppState {
     session: Mutex<Option<SerialSession>>,
     orchestrator_proc: Mutex<Option<OrchestratorProcess>>,
+    critic_session: Mutex<Option<CriticSession>>,
+}
+
+#[derive(Clone)]
+struct CriticSession {
+    orchestrator_base_url: String,
+    task: String,
+    model: String,
+    success_streak: u32,
+    success_n: u32,
+    conf_threshold: f64,
+    reward_threshold: f64,
 }
 
 #[derive(Serialize)]
@@ -260,6 +301,65 @@ fn append_desktop_audit_log(event: &str, payload: &Value) {
         "payload": payload
     });
     let _ = writeln!(file, "{}", line);
+}
+
+fn openai_api_key() -> Option<String> {
+    // Tauri GUI apps on macOS may not inherit shell env; but if launched via terminal it will.
+    // We keep this minimal: rely on OPENAI_API_KEY existing in the app environment.
+    std::env::var("OPENAI_API_KEY").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn extract_first_text_field(resp: &Value) -> Option<String> {
+    // Best-effort: Responses API returns content under output[].content[].text.
+    // We scan for the first string "text" leaf.
+    fn walk(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::String(s)) = map.get("text") {
+                    if !s.trim().is_empty() {
+                        return Some(s.clone());
+                    }
+                }
+                for (_k, child) in map.iter() {
+                    if let Some(found) = walk(child) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    if let Some(found) = walk(child) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(resp)
+}
+
+fn extract_output_text(resp: &Value) -> Option<String> {
+    // Prefer well-known Responses API fields.
+    if let Some(Value::String(s)) = resp.get("output_text") {
+        if !s.trim().is_empty() {
+            return Some(s.clone());
+        }
+    }
+    // Fall back to scanning for the first "text" field.
+    extract_first_text_field(resp)
+}
+
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
 }
 
 fn repo_logs_dir() -> Result<PathBuf, String> {
@@ -538,6 +638,163 @@ async fn vision_request(
     })
 }
 
+fn build_critic_system_prompt(task: &str) -> String {
+    // Keep it strict and conservative: fail closed if uncertain.
+    // We do not request hidden reasoning; we only need the structured fields.
+    format!(
+        "You are a Vision-Language Reward Critic for a physical RC robot.\n\
+Your job: evaluate the current camera frame against the user's task goal and produce a reward signal.\n\
+\n\
+You may be given multiple frames (ordered oldest -> newest). Use them to infer motion and progress.\n\
+\n\
+Output rules:\n\
+- Return ONLY strict JSON that matches the provided schema.\n\
+- Be conservative: if uncertain, success=false and success_confidence<=0.5.\n\
+- Never claim success unless the goal is visually confirmed in the frame.\n\
+\n\
+Progress guidance:\n\
+- If you can see the robot moved in the intended direction between frames, reward should be positive (even if not yet complete).\n\
+- If you can see the robot moved in the wrong direction or did the opposite action, reward should be negative.\n\
+\n\
+Reward rules:\n\
+- reward in [-1.0, 1.0].\n\
+- +1.0 only when the task is clearly completed.\n\
+- 0.0 when no clear progress or unclear.\n\
+- negative when the robot regresses, interacts with the wrong object, or is unsafe.\n\
+\n\
+Safety rules:\n\
+- If imminent collision risk, falling risk, or leaving camera view: critical_failure=true.\n\
+\n\
+TASK: {task}\n"
+    )
+}
+
+async fn openai_critic_eval(
+    model: &str,
+    task: &str,
+    frames_jpeg_base64: &[String],
+    last_action_text: Option<&str>,
+    executed_plan: Option<&Value>,
+    correlation_id: Option<&str>,
+) -> Result<Value, String> {
+    let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY missing in app environment".to_string())?;
+    let sys = build_critic_system_prompt(task);
+    let mut user_lines = vec![
+        format!("Goal: {task}"),
+        "You will receive multiple frames in time order (oldest -> newest). Use them to detect motion and progress.".to_string(),
+    ];
+    if let Some(a) = last_action_text {
+        let a = a.trim();
+        if !a.is_empty() {
+            user_lines.push(format!("Last action: {a}"));
+        }
+    }
+    if let Some(plan) = executed_plan {
+        // Keep it compact; tool output remains the source of truth.
+        let plan_short = trunc_for_log(&plan.to_string(), 800);
+        user_lines.push(format!("Executed plan (json): {plan_short}"));
+    }
+    user_lines.push("If robot/target is not clearly visible, do not claim success.".to_string());
+    let user_text = user_lines.join("\n");
+
+    // JSON schema for strict structured output.
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "describe": { "type": "string" },
+            "evaluate": { "type": "string" },
+            "reward": { "type": "number", "minimum": -1.0, "maximum": 1.0 },
+            "success": { "type": "boolean" },
+            "success_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "critical_failure": { "type": "boolean" },
+            "critical_failure_reason": { "type": "string" },
+            "failure_modes": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["not_visible","target_not_visible","wrong_object","no_progress","regressing","collision_risk","edge_of_view","uncertain"]
+                }
+            },
+            "notes_short": { "type": "string" }
+        },
+        "required": ["describe","evaluate","reward","success","success_confidence","critical_failure","critical_failure_reason","failure_modes","notes_short"]
+    });
+
+    let frames = frames_jpeg_base64
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    if frames.is_empty() {
+        return Err("critic_step requires at least 1 frame".to_string());
+    }
+
+    let mut user_content: Vec<Value> = Vec::new();
+    user_content.push(json!({ "type": "input_text", "text": user_text }));
+    for (idx, b64) in frames.iter().enumerate() {
+        // Tiny caption helps the model interpret ordering.
+        user_content.push(json!({ "type": "input_text", "text": format!("frame_t{idx}") }));
+        user_content.push(json!({ "type": "input_image", "image_url": format!("data:image/jpeg;base64,{b64}") }));
+    }
+    let body = json!({
+        "model": model,
+        "temperature": 0,
+        "max_output_tokens": 350,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "critic_reward",
+                "schema": schema,
+                "strict": true
+            }
+        },
+        "input": [
+            { "role": "system", "content": [{ "type": "input_text", "text": sys }] },
+            { "role": "user", "content": user_content }
+        ],
+        "metadata": {
+            "correlation_id": correlation_id,
+            "ts_ms": unix_ts_ms().to_string()
+        }
+    });
+
+    append_desktop_audit_log("openai.critic.request", &json!({ "model": model, "task": task, "cid": correlation_id }));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(OPENAI_RESPONSES_URL)
+        .bearer_auth(api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("OpenAI read body failed: {e}"))?;
+    if !status.is_success() {
+        append_desktop_audit_log("openai.critic.http_error", &json!({ "status": status.as_u16(), "body": trunc_for_log(&text, 2000) }));
+        return Err(format!("OpenAI HTTP {}: {}", status.as_u16(), trunc_for_log(&text, 1200)));
+    }
+
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("OpenAI invalid JSON: {e}; body={}", trunc_for_log(&text, 1200)))?;
+
+    // With json_schema, the model output should be valid JSON text.
+    if let Some(out_text) = extract_output_text(&parsed) {
+        if let Ok(v) = serde_json::from_str::<Value>(&out_text) {
+            append_desktop_audit_log("openai.critic.ok", &json!({ "cid": correlation_id, "out": v }));
+            return Ok(v);
+        }
+    }
+
+    // Fallback: if the provider ever returns already-parsed JSON in a field, return the whole response.
+    append_desktop_audit_log("openai.critic.parse_failed", &json!({ "cid": correlation_id, "body": trunc_for_log(&text, 1200) }));
+    Err("OpenAI critic response parse failed (no JSON tool output found)".to_string())
+}
+
 #[tauri::command]
 fn read_desktop_audit_log(tail_lines: Option<usize>) -> Result<String, String> {
     let path = repo_logs_dir()?.join("backend_audit.jsonl");
@@ -741,6 +998,184 @@ async fn vision_step(
 }
 
 #[tauri::command]
+fn critic_spawn(
+    state: State<'_, AppState>,
+    orchestrator_base_url: String,
+    task: String,
+    model: Option<String>,
+    success_consecutive_frames: Option<u32>,
+    success_confidence_threshold: Option<f64>,
+    success_reward_threshold: Option<f64>,
+) -> Result<CriticStatus, String> {
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        return Err("task is empty".to_string());
+    }
+
+    let mut lock = state
+        .critic_session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+
+    *lock = Some(CriticSession {
+        orchestrator_base_url: orchestrator_base_url.trim().to_string(),
+        task: task.clone(),
+        model: model.unwrap_or_else(|| "gpt-4.1-mini".to_string()),
+        success_streak: 0,
+        success_n: success_consecutive_frames.unwrap_or(3).max(1),
+        conf_threshold: success_confidence_threshold.unwrap_or(0.9),
+        reward_threshold: success_reward_threshold.unwrap_or(0.9),
+    });
+
+    Ok(CriticStatus {
+        running: true,
+        task: Some(task),
+        model: lock.as_ref().map(|s| s.model.clone()),
+        success_streak: 0,
+        success_n: lock.as_ref().map(|s| s.success_n).unwrap_or(3),
+    })
+}
+
+#[tauri::command]
+fn critic_status(state: State<'_, AppState>) -> Result<CriticStatus, String> {
+    let lock = state
+        .critic_session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+    if let Some(s) = &*lock {
+        Ok(CriticStatus {
+            running: true,
+            task: Some(s.task.clone()),
+            model: Some(s.model.clone()),
+            success_streak: s.success_streak,
+            success_n: s.success_n,
+        })
+    } else {
+        Ok(CriticStatus {
+            running: false,
+            task: None,
+            model: None,
+            success_streak: 0,
+            success_n: 3,
+        })
+    }
+}
+
+#[tauri::command]
+async fn critic_step(
+    state: State<'_, AppState>,
+    frames_jpeg_base64: Vec<String>,
+    last_action_text: Option<String>,
+    executed_plan: Option<Value>,
+    task_override: Option<String>,
+    correlation_id: Option<String>,
+) -> Result<CriticStepResult, String> {
+    // Snapshot config without holding the mutex across await (tauri commands require Send futures).
+    let (orch_url, task, model, conf_th, reward_th, success_n) = {
+        let lock = state
+            .critic_session
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
+        let Some(sess) = &*lock else {
+            return Err("Critic not running. Click Start Critic first.".to_string());
+        };
+        (
+            sess.orchestrator_base_url.clone(),
+            sess.task.clone(),
+            sess.model.clone(),
+            sess.conf_threshold,
+            sess.reward_threshold,
+            sess.success_n,
+        )
+    };
+
+    let cid = correlation_id.clone().unwrap_or_else(|| format!("ui-{}", unix_ts_ms()));
+    let task_to_use = task_override.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or(task.as_str());
+    let raw = openai_critic_eval(
+        &model,
+        task_to_use,
+        &frames_jpeg_base64,
+        last_action_text.as_deref(),
+        executed_plan.as_ref(),
+        Some(&cid),
+    )
+    .await?;
+
+    let reward = clamp_f64(raw.get("reward").and_then(|v| v.as_f64()).unwrap_or(0.0), -1.0, 1.0);
+    let success = raw.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let conf = clamp_f64(raw.get("success_confidence").and_then(|v| v.as_f64()).unwrap_or(0.0), 0.0, 1.0);
+    let critical = raw.get("critical_failure").and_then(|v| v.as_bool()).unwrap_or(false);
+    let critical_reason = raw
+        .get("critical_failure_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let failure_modes = raw
+        .get("failure_modes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec!["uncertain".to_string()]);
+
+    let success_this_frame = success && conf >= conf_th && reward >= reward_th;
+
+    // Update streak under lock (no await).
+    let (streak, stable) = {
+        let mut lock = state
+            .critic_session
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
+        let Some(sess) = &mut *lock else {
+            return Err("Critic stopped while step was in-flight.".to_string());
+        };
+        // Keep session task in sync if the UI changes prompt mid-run.
+        if let Some(t) = task_override.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            sess.task = t;
+        }
+        sess.success_streak = if success_this_frame { sess.success_streak + 1 } else { 0 };
+        (sess.success_streak, sess.success_streak >= success_n)
+    };
+
+    let mut interrupt_sent = false;
+    if critical {
+        // Hard safety stop (best-effort).
+        let _ = orchestrator_stop(orch_url).await;
+        interrupt_sent = true;
+    }
+
+    Ok(CriticStepResult {
+        reward,
+        success,
+        success_confidence: conf,
+        success_streak: streak,
+        success_stable: stable,
+        critical_failure: critical,
+        critical_failure_reason: critical_reason,
+        failure_modes,
+        describe: raw.get("describe").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        evaluate: raw.get("evaluate").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        notes_short: raw.get("notes_short").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        interrupt_sent,
+        raw,
+    })
+}
+
+#[tauri::command]
+fn critic_stop(state: State<'_, AppState>) -> Result<CriticStatus, String> {
+    let mut lock = state
+        .critic_session
+        .lock()
+        .map_err(|_| "State lock poisoned".to_string())?;
+    *lock = None;
+    Ok(CriticStatus {
+        running: false,
+        task: None,
+        model: None,
+        success_streak: 0,
+        success_n: 3,
+    })
+}
+
+#[tauri::command]
 fn node_probe(host: String, port: u16) -> Result<NodeProbeStatus, String> {
     let target = format!("{}:{}", host.trim(), port);
     match probe_daemon_node(&host, port) {
@@ -768,7 +1203,7 @@ fn node_probe(host: String, port: u16) -> Result<NodeProbeStatus, String> {
 }
 
 #[tauri::command]
-fn orchestrator_spawn(
+async fn orchestrator_spawn(
     state: State<'_, AppState>,
     nodes: Vec<String>,
     http_port: Option<u16>,
@@ -776,28 +1211,79 @@ fn orchestrator_spawn(
     planner_url: Option<String>,
     step_timeout_s: Option<f64>,
 ) -> Result<OrchestratorProcessStatus, String> {
-    let mut lock = state
-        .orchestrator_proc
-        .lock()
-        .map_err(|_| "State lock poisoned".to_string())?;
+    // Snapshot/clear state without holding the mutex across awaits.
+    {
+        let mut lock = state
+            .orchestrator_proc
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
 
-    // If already running, return status.
-    if let Some(proc_) = &mut *lock {
-        if proc_.child.try_wait().map_err(|e| format!("Failed to query orchestrator process: {e}"))?.is_none() {
-            return Ok(OrchestratorProcessStatus {
-                running: true,
-                pid: Some(proc_.child.id()),
-                http_base_url: Some(proc_.http_base_url.clone()),
-                args: Some(proc_.args.clone()),
-            });
+        // If already running, return status.
+        if let Some(proc_) = &mut *lock {
+            if proc_.child.try_wait().map_err(|e| format!("Failed to query orchestrator process: {e}"))?.is_none() {
+                return Ok(OrchestratorProcessStatus {
+                    running: true,
+                    pid: Some(proc_.child.id()),
+                    http_base_url: Some(proc_.http_base_url.clone()),
+                    args: Some(proc_.args.clone()),
+                });
+            }
+            // Child exited; clear and continue to respawn.
+            *lock = None;
         }
-        // Child exited; clear and continue to respawn.
-        *lock = None;
     }
 
     let http_host_raw = http_host.unwrap_or_else(|| "127.0.0.1".to_string());
     let http_host_ip = normalize_local_host(&http_host_raw)?;
-    let preferred_port = http_port.unwrap_or(5056);
+    let preferred_port = http_port.unwrap_or(5055);
+
+    // If something is already listening on the preferred port, check if it's already a DAEMON orchestrator.
+    // If so, reuse it instead of spawning a second orchestrator on an ephemeral port.
+    {
+        let base = format!("http://{}:{}", http_host_raw.trim(), preferred_port);
+        let url = format!("{base}/status");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .timeout(Duration::from_millis(400))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        append_desktop_audit_log("orchestrator.reuse_existing", &json!({ "base_url": base, "status": v }));
+                        return Ok(OrchestratorProcessStatus {
+                            running: false,
+                            pid: None,
+                            http_base_url: Some(base),
+                            args: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Re-check state (another call may have spawned while we were probing).
+    {
+        let mut lock = state
+            .orchestrator_proc
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
+        if let Some(proc_) = &mut *lock {
+            if proc_.child.try_wait().map_err(|e| format!("Failed to query orchestrator process: {e}"))?.is_none() {
+                return Ok(OrchestratorProcessStatus {
+                    running: true,
+                    pid: Some(proc_.child.id()),
+                    http_base_url: Some(proc_.http_base_url.clone()),
+                    args: Some(proc_.args.clone()),
+                });
+            }
+            *lock = None;
+        }
+    }
+
     let http_port = pick_free_tcp_port(http_host_ip, preferred_port)?;
     let repo_root = find_repo_root()?;
     let orch_path = repo_root.join("orchestrator").join("orchestrator.py");
@@ -862,18 +1348,24 @@ fn orchestrator_spawn(
         .map_err(|e| format!("{e}. If a previous orchestrator is running, stop it or use a different port."))?;
 
     let http_base_url = format!("http://{}:{}", http_host_raw.trim(), http_port);
-    *lock = Some(OrchestratorProcess {
-        child,
-        args,
-        http_base_url: http_base_url.clone(),
-    });
+    {
+        let mut lock = state
+            .orchestrator_proc
+            .lock()
+            .map_err(|_| "State lock poisoned".to_string())?;
+        *lock = Some(OrchestratorProcess {
+            child,
+            args,
+            http_base_url: http_base_url.clone(),
+        });
 
-    Ok(OrchestratorProcessStatus {
-        running: true,
-        pid: lock.as_ref().map(|p| p.child.id()),
-        http_base_url: Some(http_base_url),
-        args: lock.as_ref().map(|p| p.args.clone()),
-    })
+        Ok(OrchestratorProcessStatus {
+            running: true,
+            pid: lock.as_ref().map(|p| p.child.id()),
+            http_base_url: Some(http_base_url),
+            args: lock.as_ref().map(|p| p.args.clone()),
+        })
+    }
 }
 
 #[tauri::command]
@@ -941,6 +1433,10 @@ pub fn run() {
             orchestrator_execute_plan,
             orchestrator_stop,
             vision_step,
+            critic_spawn,
+            critic_status,
+            critic_step,
+            critic_stop,
             node_probe,
             write_debug_log,
             read_debug_log,

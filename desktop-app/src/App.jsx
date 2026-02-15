@@ -3,10 +3,10 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 
 const DEFAULT_VERCEL_BASE_URL = "https://daemon-ten-chi.vercel.app";
-const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5056";
+const DEFAULT_ORCH_BASE_URL = "http://127.0.0.1:5055";
 const DEFAULT_PI_BRAIN_BASE_URL = "http://vporto26.local:8090";
-const FRAME_WIDTH = 320;
-const FRAME_HEIGHT = 240;
+const FRAME_WIDTH = 640;
+const FRAME_HEIGHT = 480;
 const DEFAULT_CAPTURE_INTERVAL_MS = 180;
 const STATUS_POLL_MS = 2000;
 const RUNTIME_IS_TAURI = isTauri();
@@ -31,10 +31,30 @@ const INITIAL_STATE = {
   }
 };
 
-const DEFAULT_PROMPT = "pick up the banana";
+const DEFAULT_PROMPT = "move forward then backward";
+
+function readLocalStorage(key) {
+  try {
+    return globalThis?.localStorage?.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function readPromptWithMigration(key) {
+  const v = readLocalStorage(key);
+  if (!v) return null;
+  // Migrate the old demo default to the new default without overriding real user prompts.
+  if (String(v).trim() === "pick up the banana") return null;
+  return v;
+}
 
 function nowStamp() {
   return new Date().toLocaleTimeString();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function makeCorrelationId() {
@@ -80,6 +100,19 @@ async function captureFrameBase64(video, canvas) {
   }
 
   return blobToBase64(blob);
+}
+
+function manifestTokens(systemManifest) {
+  const tokens = new Set();
+  const nodes = Array.isArray(systemManifest?.nodes) ? systemManifest.nodes : [];
+  for (const node of nodes) {
+    const cmds = Array.isArray(node?.commands) ? node.commands : [];
+    for (const cmd of cmds) {
+      const tok = cmd?.token;
+      if (typeof tok === "string" && tok.trim()) tokens.add(tok.trim());
+    }
+  }
+  return tokens;
 }
 
 async function fetchSnapshotBase64(snapshotUrl) {
@@ -289,18 +322,36 @@ function App() {
   const streamRef = useRef(null);
   const liveTimerRef = useRef(null);
   const liveEnabledRef = useRef(false);
+  const criticTimerRef = useRef(null);
+  const criticEnabledRef = useRef(false);
+  const criticInFlightRef = useRef(false);
   const loopIntervalRef = useRef(DEFAULT_CAPTURE_INTERVAL_MS);
   const inFlightRef = useRef(false);
   const stateRef = useRef(INITIAL_STATE);
   const appliedPromptRef = useRef(DEFAULT_PROMPT);
 
-  const [taskPrompt, setTaskPrompt] = useState(DEFAULT_PROMPT);
-  const [draftPrompt, setDraftPrompt] = useState(DEFAULT_PROMPT);
+  const [taskPrompt, setTaskPrompt] = useState(readPromptWithMigration("daemon.taskPrompt") || DEFAULT_PROMPT);
+  const [draftPrompt, setDraftPrompt] = useState(readPromptWithMigration("daemon.draftPrompt") || DEFAULT_PROMPT);
   const [captureIntervalMs, setCaptureIntervalMs] = useState(DEFAULT_CAPTURE_INTERVAL_MS);
   const [liveEnabled, setLiveEnabled] = useState(false);
   const [sendingFrames, setSendingFrames] = useState(false);
   const [dryRun, setDryRun] = useState(false);
-  const [visionMode, setVisionMode] = useState(import.meta.env.VITE_VISION_MODE || "pi"); // pi | cloud
+  const [visionMode, setVisionMode] = useState(() => {
+    const stored = readLocalStorage("daemon.visionMode");
+    if (stored === "pi" || stored === "cloud") return stored;
+    const env = import.meta.env.VITE_VISION_MODE;
+    if (env === "pi" || env === "cloud") return env;
+    // Default to cloud in Tauri so camera preview + critic work out-of-the-box.
+    return RUNTIME_IS_TAURI ? "cloud" : "pi";
+  }); // pi | cloud
+
+  const [criticEnabled, setCriticEnabled] = useState(false);
+  const [criticError, setCriticError] = useState("");
+  const [criticResult, setCriticResult] = useState(null);
+  const [criticModel, setCriticModel] = useState("gpt-4.1-mini");
+  const [criticSuccessN, setCriticSuccessN] = useState(3);
+  const [criticConfTh, setCriticConfTh] = useState(0.9);
+  const [criticRewardTh, setCriticRewardTh] = useState(0.9);
 
   const [fsmState, setFsmState] = useState(INITIAL_STATE);
   const [perception, setPerception] = useState(null);
@@ -314,7 +365,7 @@ function App() {
   const [lastSentInstruction, setLastSentInstruction] = useState("");
   const [errorText, setErrorText] = useState("");
   const [chartSeries, setChartSeries] = useState([]);
-  const [orchestratorBaseUrl, setOrchestratorBaseUrl] = useState(ORCH_BASE_URL);
+  const [orchestratorBaseUrl, setOrchestratorBaseUrl] = useState(readLocalStorage("daemon.orchestratorBaseUrl") || ORCH_BASE_URL);
   // Default to 8766 because 8765 is commonly used by the legacy JSON mecanum bridge.
   const [nodeEndpoints, setNodeEndpoints] = useState("base=vporto26.local:8766");
   const [orchestratorProc, setOrchestratorProc] = useState({ running: false, pid: null, httpBaseUrl: null, args: null });
@@ -340,6 +391,8 @@ function App() {
         await invoke("write_debug_log", { fileName: "vision_trace.jsonl", payload: entry });
       } else if (event.startsWith("orchestrator.")) {
         await invoke("write_debug_log", { fileName: "orchestrator_trace.jsonl", payload: entry });
+      } else if (event.startsWith("critic.")) {
+        await invoke("write_debug_log", { fileName: "critic_trace.jsonl", payload: entry });
       }
     } catch {
       // Ignore logging failures.
@@ -373,6 +426,7 @@ function App() {
 
   const promptReady = taskPrompt.trim().length > 0;
   const draftReady = draftPrompt.trim().length > 0;
+  const criticPromptReady = promptReady || draftReady;
 
   const statusText = useMemo(() => {
     if (!liveEnabled) {
@@ -410,13 +464,29 @@ function App() {
     appendTrace("prompt.apply", { prompt: next });
     setErrorText("");
 
-    // Submit should trigger action immediately without requiring Single Step.
-    await executeSingleVisionStep({ executePlan: !dryRun });
+    // Submit should trigger action immediately without requiring Single Step,
+    // unless a continuous loop (critic) is already commanding hardware.
+    if (!criticEnabledRef.current) {
+      await executeSingleVisionStep({ executePlan: !dryRun });
+    } else {
+      appendTrace("prompt.apply.deferred", { reason: "critic_running" });
+    }
   };
 
   useEffect(() => {
     appliedPromptRef.current = taskPrompt.trim() || DEFAULT_PROMPT;
   }, [taskPrompt]);
+
+  useEffect(() => {
+    try {
+      globalThis?.localStorage?.setItem("daemon.visionMode", String(visionMode || ""));
+      globalThis?.localStorage?.setItem("daemon.orchestratorBaseUrl", String(orchestratorBaseUrl || ""));
+      globalThis?.localStorage?.setItem("daemon.taskPrompt", String(taskPrompt || ""));
+      globalThis?.localStorage?.setItem("daemon.draftPrompt", String(draftPrompt || ""));
+    } catch {
+      // ignore
+    }
+  }, [visionMode, orchestratorBaseUrl, taskPrompt, draftPrompt]);
 
   useEffect(() => {
     refreshBackendAuditLog();
@@ -463,6 +533,10 @@ function App() {
         try {
           const proc = await invoke("orchestrator_process_status");
           setOrchestratorProc(proc);
+          // If the app is managing an orchestrator, keep the UI base URL pinned to the actual chosen port.
+          if (proc?.running && proc?.httpBaseUrl && String(proc.httpBaseUrl) !== String(orchestratorBaseUrl)) {
+            setOrchestratorBaseUrl(String(proc.httpBaseUrl));
+          }
         } catch {
           // Ignore.
         }
@@ -607,19 +681,16 @@ function App() {
   };
 
   const effectiveCameraMode = useMemo(() => {
-    // In Pi-brain mode the laptop should not capture frames.
-    if (visionMode === "pi") return "none";
     if (cameraMode === "local") return "local";
     if (cameraMode === "remote") return "remote";
     // auto: prefer remote only if we have a usable snapshot URL (MJPEG is for preview only).
     if (String(cameraSnapshotUrl || "").trim()) return "remote";
     return "local";
-  }, [visionMode, cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
+  }, [cameraMode, cameraSnapshotUrl, cameraMjpegUrl]);
 
-  const ensureCamera = async () => {
-    if (visionMode === "pi") {
-      return;
-    }
+  const ensureCamera = async ({ force } = {}) => {
+    // In Pi-brain mode, the planner can run without the laptop camera; only force camera for preview/critic.
+    if (visionMode === "pi" && !force) return;
     if (effectiveCameraMode === "remote") {
       return;
     }
@@ -751,7 +822,7 @@ function App() {
     };
   }, []);
 
-  const executeSingleVisionStep = async ({ executePlan }) => {
+  const executeSingleVisionStep = async ({ executePlan, frameJpegBase64Override = null, correlationIdOverride = null } = {}) => {
     if (inFlightRef.current) {
       return;
     }
@@ -768,7 +839,29 @@ function App() {
       await ensureCamera();
 
       const instructionToSend = appliedPromptRef.current.trim();
-      const correlationId = makeCorrelationId();
+      const correlationId = String(correlationIdOverride || makeCorrelationId());
+      let manifestForVision = systemManifest;
+      if (visionMode !== "pi") {
+        // Avoid cloud vision failures caused by stale/empty manifests (common when you're talking to the wrong orchestrator port).
+        if (!manifestForVision) {
+          try {
+            const status = await orchestratorStatus(orchestratorBaseUrl);
+            manifestForVision = status?.system_manifest || null;
+            setSystemManifest(manifestForVision);
+          } catch {
+            // keep null; we'll error below with a clearer message.
+          }
+        }
+        const toks = manifestTokens(manifestForVision);
+        const expected = String(capabilities?.base_fwd_token || "FWD").trim() || "FWD";
+        if (!toks.has(expected)) {
+          throw new Error(
+            `Orchestrator system_manifest is missing required token '${expected}'. ` +
+              `This usually means you are pointing at the wrong orchestrator (stale process / wrong port) or base is disconnected. ` +
+              `Fix: check ${orchestratorBaseUrl}/status and ensure base is connected and lists '${expected}'.`
+          );
+        }
+      }
       const camera_meta =
         visionMode === "pi"
           ? { source: "pi_internal" }
@@ -784,21 +877,23 @@ function App() {
       const visionPayload = {
         instruction: instructionToSend,
         correlation_id: correlationId,
-        system_manifest: systemManifest,
+        system_manifest: manifestForVision,
         camera_meta,
         state: stateRef.current
       };
       if (visionMode !== "pi") {
-        const frame_jpeg_base64 = await (() => {
-          if (effectiveCameraMode !== "remote") {
-            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
-          }
-          const snapUrl = String(cameraSnapshotUrl || "").trim();
-          if (!snapUrl) {
-            throw new Error("robot camera selected but snapshot_url is empty");
-          }
-          return fetchSnapshotBase64(snapUrl);
-        })();
+        const frame_jpeg_base64 =
+          frameJpegBase64Override ||
+          (await (() => {
+            if (effectiveCameraMode !== "remote") {
+              return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+            }
+            const snapUrl = String(cameraSnapshotUrl || "").trim();
+            if (!snapUrl) {
+              throw new Error("robot camera selected but snapshot_url is empty");
+            }
+            return fetchSnapshotBase64(snapUrl);
+          })());
         if (!frame_jpeg_base64) {
           throw new Error("camera frame unavailable");
         }
@@ -884,6 +979,7 @@ function App() {
       if (String(nextState?.stage || "").toUpperCase() === "DONE" && liveEnabled) {
         await stopLoop({ sendStop: false });
       }
+      return { ok: true, correlationId: planCorrelationId, plan: nextPlan };
     } catch (error) {
       const msg = String(error);
       setErrorText(msg);
@@ -900,6 +996,7 @@ function App() {
       if (liveEnabled) {
         await stopLoop({ sendStop: true });
       }
+      return { ok: false, error: msg };
     } finally {
       inFlightRef.current = false;
       setSendingFrames(false);
@@ -954,6 +1051,151 @@ function App() {
     await executeSingleVisionStep({ executePlan: !dryRun });
   };
 
+  const stopCriticLoop = async () => {
+    criticEnabledRef.current = false;
+    setCriticEnabled(false);
+    if (criticTimerRef.current) {
+      clearTimeout(criticTimerRef.current);
+      criticTimerRef.current = null;
+    }
+    if (RUNTIME_IS_TAURI) {
+      try {
+        await invoke("critic_stop");
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const startCriticLoop = async () => {
+    if (!RUNTIME_IS_TAURI) {
+      setCriticError("Critic monitor requires Tauri runtime (backend holds OPENAI_API_KEY).");
+      return;
+    }
+    const task = (taskPrompt || "").trim() || (draftPrompt || "").trim();
+    if (!task) {
+      setCriticError("Task prompt is required.");
+      return;
+    }
+
+    setCriticError("");
+    setCriticResult(null);
+    setCriticEnabled(true);
+    criticEnabledRef.current = true;
+
+    // Stop the existing live loop so we don't double-execute robot actions.
+    if (liveEnabledRef.current) {
+      await stopLoop({ sendStop: false });
+    }
+
+    try {
+      await ensureCamera({ force: true });
+    } catch (error) {
+      await stopCriticLoop();
+      setCriticError(String(error));
+      return;
+    }
+
+    try {
+      await invoke("critic_spawn", {
+        orchestratorBaseUrl,
+        task,
+        model: criticModel,
+        successConsecutiveFrames: Number(criticSuccessN),
+        successConfidenceThreshold: Number(criticConfTh),
+        successRewardThreshold: Number(criticRewardTh)
+      });
+    } catch (error) {
+      await stopCriticLoop();
+      setCriticError(String(error));
+      return;
+    }
+
+    const loop = async () => {
+      if (!criticEnabledRef.current) return;
+      if (criticInFlightRef.current) {
+        criticTimerRef.current = setTimeout(loop, 200);
+        return;
+      }
+      criticInFlightRef.current = true;
+
+      try {
+        const frame0 = await (() => {
+          if (effectiveCameraMode !== "remote") {
+            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+          }
+          const snapUrl = String(cameraSnapshotUrl || "").trim();
+          if (!snapUrl) {
+            throw new Error("robot camera selected but snapshot_url is empty");
+          }
+          return fetchSnapshotBase64(snapUrl);
+        })();
+        if (!frame0) {
+          throw new Error("camera frame unavailable");
+        }
+
+        const correlationId = makeCorrelationId();
+
+        // Execute robot commands according to the task prompt (policy -> plan -> orchestrator).
+        const exec = await executeSingleVisionStep({
+          executePlan: true,
+          frameJpegBase64Override: frame0,
+          correlationIdOverride: correlationId
+        });
+
+        // Capture a couple post-action frames so the critic can detect motion/progress.
+        await sleep(260);
+        const frame1 = await (() => {
+          if (effectiveCameraMode !== "remote") {
+            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+          }
+          const snapUrl = String(cameraSnapshotUrl || "").trim();
+          if (!snapUrl) {
+            throw new Error("robot camera selected but snapshot_url is empty");
+          }
+          return fetchSnapshotBase64(snapUrl);
+        })();
+        await sleep(260);
+        const frame2 = await (() => {
+          if (effectiveCameraMode !== "remote") {
+            return captureFrameBase64(videoRef.current, captureCanvasRef.current);
+          }
+          const snapUrl = String(cameraSnapshotUrl || "").trim();
+          if (!snapUrl) {
+            throw new Error("robot camera selected but snapshot_url is empty");
+          }
+          return fetchSnapshotBase64(snapUrl);
+        })();
+
+        const taskOverride = (taskPrompt || "").trim() || (draftPrompt || "").trim();
+        const framesJpegBase64 = [frame0, frame1, frame2].filter(Boolean);
+        const result = await invoke("critic_step", {
+          framesJpegBase64,
+          lastActionText,
+          executedPlan: exec?.plan || lastPlan,
+          taskOverride,
+          correlationId
+        });
+        setCriticResult(result);
+        setLastDebug((prev) => ({ ...(prev || {}), critic: result }));
+
+        if (result?.successStable) {
+          await stopCriticLoop();
+        }
+      } catch (error) {
+        setCriticError(String(error));
+        await stopCriticLoop();
+      } finally {
+        criticInFlightRef.current = false;
+      }
+
+      // Each tick hits vision + orchestrator + OpenAI; keep it moderate.
+      criticTimerRef.current = setTimeout(loop, 450);
+    };
+
+    criticTimerRef.current = setTimeout(loop, 80);
+  };
+
   return (
     <div className="studio">
       <div className="hero">
@@ -994,7 +1236,7 @@ function App() {
         </div>
         <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <span>camera:</span>
-          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)} disabled={visionMode === "pi"}>
+          <select value={cameraMode} onChange={(event) => setCameraMode(event.target.value)}>
             <option value="auto">auto</option>
             <option value="local">local webcam</option>
             <option value="remote">robot camera</option>
@@ -1005,7 +1247,6 @@ function App() {
             onChange={(event) => setCameraSnapshotUrl(event.target.value)}
             placeholder="http://vporto26.local:8081/snapshot.jpg"
             style={{ width: 360 }}
-            disabled={visionMode === "pi"}
           />
           <span>mjpeg_url</span>
           <input
@@ -1013,7 +1254,6 @@ function App() {
             onChange={(event) => setCameraMjpegUrl(event.target.value)}
             placeholder="http://vporto26.local:8081/stream.mjpg"
             style={{ width: 320 }}
-            disabled={visionMode === "pi"}
           />
           <span>mode={effectiveCameraMode}</span>
         </div>
@@ -1085,6 +1325,14 @@ function App() {
         </button>
         <button className="secondary" onClick={handleSingleStep} disabled={!promptReady}>Single Step</button>
         <button className="panic" onClick={handleStop}>STOP</button>
+        <button
+          className={criticEnabled ? "secondary active" : "secondary"}
+          onClick={() => (criticEnabled ? void stopCriticLoop() : void startCriticLoop())}
+          disabled={!criticPromptReady || !RUNTIME_IS_TAURI}
+          title="Runs an OpenAI vision-language critic as a reward function and logs reward/success over time."
+        >
+          {criticEnabled ? "Stop Critic" : "Start Critic"}
+        </button>
         <label className="toggle">
           <input type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
           <span>Dry Run</span>
@@ -1106,64 +1354,68 @@ function App() {
         <div><strong>Last sent instruction:</strong> {lastSentInstruction || "-"}</div>
       </section>
 
-      <section className="panel">
-        <h2>Submit Trace</h2>
-        <div className="controls" style={{ justifyContent: "flex-start" }}>
-          <button className="secondary" onClick={() => setTraceLog([])}>Clear UI Trace</button>
-          <button className="secondary" onClick={refreshBackendAuditLog} disabled={!RUNTIME_IS_TAURI}>
-            Refresh Backend Audit
-          </button>
-        </div>
-        <pre>{traceLog.length ? traceLog.map((x) => JSON.stringify(x)).join("\n") : "No trace events yet."}</pre>
-      </section>
-
-      <section className="panel">
-        <h2>Tauri Backend Audit Log</h2>
-        <pre>{backendAuditLog || "No backend audit lines yet."}</pre>
-      </section>
-
       {lastOrchestratorError ? <section className="error">Last orchestrator error: {lastOrchestratorError}</section> : null}
       {errorText ? <section className="error">{errorText}</section> : null}
 
       <main className="grid">
-        {visionMode === "pi" ? (
-          <section className="panel video-panel">
-            <h2>Camera</h2>
+        <section className="panel video-panel">
+          <h2>Live Camera</h2>
+          {visionMode === "pi" ? (
             <div className="note">
-              Pi brain mode: the robot captures and uses the camera internally. No camera preview is shown on the laptop.
+              Planner is in Pi mode (no frames are uploaded for planning). This preview is independent and is used by the Critic monitor.
             </div>
-            <div className="metrics">
-              <span>found: {String(Boolean(perception?.found))}</span>
-              <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
-              <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
-              <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
-            </div>
-          </section>
-        ) : (
-          <section className="panel video-panel">
-            <h2>Live Camera</h2>
-            <div className="video-shell">
-              {effectiveCameraMode === "remote" ? (
-                <img
-                  ref={remoteImgRef}
-                  className="video"
-                  alt="robot camera"
-                  src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
-                />
-              ) : (
-                <video ref={videoRef} autoPlay muted playsInline className="video" />
-              )}
-              <canvas ref={overlayCanvasRef} className="overlay" />
-            </div>
-            <canvas ref={captureCanvasRef} className="hidden-canvas" />
-            <div className="metrics">
-              <span>found: {String(Boolean(perception?.found))}</span>
-              <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
-              <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
-              <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
-            </div>
-          </section>
-        )}
+          ) : null}
+          <div className="video-shell">
+            {effectiveCameraMode === "remote" ? (
+              <img
+                ref={remoteImgRef}
+                className="video"
+                alt="robot camera"
+                src={(cameraMjpegUrl || cameraSnapshotUrl || "").trim()}
+              />
+            ) : (
+              <video ref={videoRef} autoPlay muted playsInline className="video" />
+            )}
+            <canvas ref={overlayCanvasRef} className="overlay" />
+          </div>
+          <canvas ref={captureCanvasRef} className="hidden-canvas" />
+          <div className="metrics">
+            <span>found: {String(Boolean(perception?.found))}</span>
+            <span>confidence: {Number(perception?.confidence || 0).toFixed(3)}</span>
+            <span>offset_x: {Number(perception?.offset_x || perception?.center_offset_x || 0).toFixed(3)}</span>
+            <span>area: {Number(perception?.area || 0).toFixed(1)}</span>
+          </div>
+        </section>
+
+        <section className="panel">
+          <h2>Critic (Reward Function)</h2>
+          <div className="note">
+            Runs a vision-language critic on the current frame. Use this to see if behavior is correct, unsafe, or cheating.
+            Success is only stable after {criticSuccessN} consecutive high-confidence frames.
+          </div>
+          {criticError ? <div className="error">Critic: {criticError}</div> : null}
+          <div className="note" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <span>model</span>
+            <input value={criticModel} onChange={(e) => setCriticModel(e.target.value)} style={{ width: 140 }} />
+            <span>N</span>
+            <input value={criticSuccessN} onChange={(e) => setCriticSuccessN(Number(e.target.value || 0))} type="number" min="1" style={{ width: 70 }} />
+            <span>conf&gt;=</span>
+            <input value={criticConfTh} onChange={(e) => setCriticConfTh(Number(e.target.value || 0))} type="number" step="0.05" min="0" max="1" style={{ width: 80 }} />
+            <span>reward&gt;=</span>
+            <input value={criticRewardTh} onChange={(e) => setCriticRewardTh(Number(e.target.value || 0))} type="number" step="0.05" min="0" max="1" style={{ width: 80 }} />
+          </div>
+          <div className="metrics">
+            <span>running: {String(Boolean(criticEnabled))}</span>
+            <span>reward: {Number(criticResult?.reward || 0).toFixed(3)}</span>
+            <span>success: {String(Boolean(criticResult?.success))}</span>
+            <span>conf: {Number(criticResult?.successConfidence || 0).toFixed(3)}</span>
+            <span>streak: {Number(criticResult?.successStreak || 0)}</span>
+            <span>stable: {String(Boolean(criticResult?.successStable))}</span>
+            <span>critical: {String(Boolean(criticResult?.criticalFailure))}</span>
+            <span>interrupt_sent: {String(Boolean(criticResult?.interruptSent))}</span>
+          </div>
+          <pre>{criticResult ? JSON.stringify(criticResult, null, 2) : "No critic results yet. Click Start Critic."}</pre>
+        </section>
 
         <section className="panel">
           <h2>Perception + State</h2>
@@ -1216,6 +1468,22 @@ function App() {
           </div>
         </section>
       </main>
+
+      <section className="panel">
+        <h2>Submit Trace</h2>
+        <div className="controls" style={{ justifyContent: "flex-start" }}>
+          <button className="secondary" onClick={() => setTraceLog([])}>Clear UI Trace</button>
+          <button className="secondary" onClick={refreshBackendAuditLog} disabled={!RUNTIME_IS_TAURI}>
+            Refresh Backend Audit
+          </button>
+        </div>
+        <pre>{traceLog.length ? traceLog.map((x) => JSON.stringify(x)).join("\n") : "No trace events yet."}</pre>
+      </section>
+
+      <section className="panel">
+        <h2>Tauri Backend Audit Log</h2>
+        <pre>{backendAuditLog || "No backend audit lines yet."}</pre>
+      </section>
     </div>
   );
 }
