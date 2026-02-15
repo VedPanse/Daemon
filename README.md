@@ -50,3 +50,6 @@ npm run build
 cd src-tauri
 cargo check
 ```
+
+## Troubleshooting
+See `TROUBLESHOOT.md`.
