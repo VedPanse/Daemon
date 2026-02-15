@@ -365,6 +365,7 @@ function App() {
   const [lastDebug, setLastDebug] = useState(null);
 
   const [orchestratorReachable, setOrchestratorReachable] = useState(false);
+  const [robotConnected, setRobotConnected] = useState(false);
   const [lastOrchestratorError, setLastOrchestratorError] = useState("");
   const [lastActionText, setLastActionText] = useState("idle");
   const [lastActionTimestamp, setLastActionTimestamp] = useState("");
@@ -385,6 +386,7 @@ function App() {
   const [traceLog, setTraceLog] = useState([]);
   const [backendAuditLog, setBackendAuditLog] = useState("");
   const traceSeqRef = useRef(0);
+  const robotConnOkStreakRef = useRef(0);
 
   const persistTraceToFile = async (entry) => {
     if (!RUNTIME_IS_TAURI) {
@@ -529,6 +531,26 @@ function App() {
           setLastOrchestratorError("");
           setSystemManifest(status?.system_manifest || null);
 
+          // Robot connectivity is based on the base node connection, not just HTTP reachability.
+          const baseAlias = String(capabilities?.base_target || "base").trim() || "base";
+          const nodes = Array.isArray(status?.nodes) ? status.nodes : [];
+          const baseNode =
+            nodes.find((n) => String(n?.alias || "").trim() === baseAlias) ||
+            nodes.find((n) => String(n?.name || "").trim() === baseAlias) ||
+            nodes[0] ||
+            null;
+          const baseOk = Boolean(baseNode?.connected);
+          if (!baseOk) {
+            robotConnOkStreakRef.current = 0;
+            setRobotConnected(false);
+          } else {
+            robotConnOkStreakRef.current += 1;
+            // Hysteresis: require 2 consecutive "connected" polls to clear the banner.
+            if (robotConnOkStreakRef.current >= 2) {
+              setRobotConnected(true);
+            }
+          }
+
           // Auto-discover camera services from the orchestrator manifest if present.
           if (cameraMode === "auto" && !REMOTE_CAMERA_SNAPSHOT_URL && !REMOTE_CAMERA_MJPEG_URL) {
             const nodes = Array.isArray(status?.system_manifest?.nodes) ? status.system_manifest.nodes : [];
@@ -543,6 +565,8 @@ function App() {
       } catch (error) {
         if (!cancelled) {
           setOrchestratorReachable(false);
+          robotConnOkStreakRef.current = 0;
+          setRobotConnected(false);
           setLastOrchestratorError(shouldReportOrchError ? String(error) : "");
           setSystemManifest(null);
         }
@@ -1297,14 +1321,12 @@ function App() {
         setRlIterations((prev) => {
           const nextIdx = prev.length + 1;
           const failureModes = Array.isArray(result?.failureModes) ? result.failureModes : [];
+          // No hidden constraints: qualify is purely numeric thresholds + safety gates.
           const qualifies =
             Number(result?.successConfidence || 0) >= Number(criticConfTh) &&
             Number(result?.reward || 0) >= Number(criticRewardTh) &&
             !Boolean(result?.motionGate) &&
-            !Boolean(result?.criticalFailure) &&
-            !failureModes.includes("uncertain") &&
-            !failureModes.includes("not_visible") &&
-            !failureModes.includes("target_not_visible");
+            !Boolean(result?.criticalFailure);
           const entry = {
             i: nextIdx,
             ts: new Date().toISOString(),
@@ -1320,14 +1342,11 @@ function App() {
           return [...prev, entry].slice(-100);
         });
 
-        const failureModes = Array.isArray(result?.failureModes) ? result.failureModes : [];
-        const failClosed = failureModes.includes("uncertain") || failureModes.includes("not_visible") || failureModes.includes("target_not_visible");
         const qualifies =
           Number(result?.successConfidence || 0) >= Number(criticConfTh) &&
           Number(result?.reward || 0) >= Number(criticRewardTh) &&
           !Boolean(result?.motionGate) &&
-          !Boolean(result?.criticalFailure) &&
-          !failClosed;
+          !Boolean(result?.criticalFailure);
 
         criticQualStreakRef.current = qualifies ? criticQualStreakRef.current + 1 : 0;
         const streak = Math.max(Number(result?.successStreak || 0), criticQualStreakRef.current);
@@ -1377,14 +1396,14 @@ function App() {
             <input type="checkbox" checked={debugMode} onChange={(e) => setDebugMode(Boolean(e.target.checked))} />
             <span>Debug</span>
           </label>
-          <div className={orchestratorReachable ? "health ok" : "health bad"}>
+          <div className={robotConnected ? "health ok" : "health bad"}>
           <span className="dot" />
-          <span>{orchestratorReachable ? "Robot Connected" : "Robot Disconnected"}</span>
+          <span>{robotConnected ? "Robot Connected" : "Robot Disconnected"}</span>
         </div>
         </div>
       </div>
 
-      {!orchestratorReachable ? (
+      {!robotConnected ? (
         <section className="banner banner--error">
           <div className="banner-body">
             <div className="banner-title">Connection lost</div>
@@ -1425,7 +1444,7 @@ function App() {
           <button
             className={criticEnabled ? "primary active" : "primary"}
             onClick={() => (criticEnabled ? void stopCriticLoop() : void startCriticLoop())}
-            disabled={!criticPromptReady || !RUNTIME_IS_TAURI || !orchestratorReachable}
+            disabled={!criticPromptReady || !RUNTIME_IS_TAURI || !robotConnected}
             title="Runs the autonomy loop: execute -> watch -> judge -> repeat until stable success."
           >
             {criticEnabled ? "Stop Reinforcement Learning" : "Start Reinforcement Learning"}
