@@ -71,3 +71,4 @@ web/.next/
 
 # TypeScript incremental artifacts
 *.tsbuildinfo
+SETUP.md
